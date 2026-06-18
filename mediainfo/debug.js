@@ -2,47 +2,38 @@
     'use strict';
 
     /* ───────────────────────────────────────────────────────────
-       MEDIAINFO DEBUG — диагностика получения torrent hash
+       MEDIAINFO DEBUG v0.2 — диагностика получения torrent hash
        Виден на экране. Только для личного использования.
+
+       Главное отличие: весь код в локальных try/catch → реальный
+       текст ошибки виден (cross-origin маскировка обходится).
+       Глобальный «Script error.» сворачивается в счётчик.
        ─────────────────────────────────────────────────────────── */
 
-    var VERSION   = 'v0.1';
-    var MAX_LINES = 60;
+    var VERSION   = 'v0.2';
+    var MAX_LINES = 70;
 
     /* ── overlay (#mi-log, снизу экрана) ─────────────────────── */
 
     var box = document.createElement('div');
     box.id = 'mi-log';
     box.style.cssText = [
-        'position:fixed',
-        'left:0',
-        'right:0',
-        'bottom:0',
-        'max-height:46%',
-        'z-index:2147483647',
-        'background:rgba(0,0,0,.82)',
-        'color:#7CFC00',
-        'font-family:monospace',
-        'font-size:16px',
-        'line-height:1.3',
-        'padding:.5em .7em',
-        'border-top:2px solid #7CFC00',
-        'overflow:hidden',
-        'white-space:pre-wrap',
-        'word-break:break-all',
+        'position:fixed', 'left:0', 'right:0', 'bottom:0',
+        'max-height:48%', 'z-index:2147483647',
+        'background:rgba(0,0,0,.82)', 'color:#7CFC00',
+        'font-family:monospace', 'font-size:16px', 'line-height:1.3',
+        'padding:.5em .7em', 'border-top:2px solid #7CFC00',
+        'overflow:hidden', 'white-space:pre-wrap', 'word-break:break-all',
         'pointer-events:none'
     ].join(';');
 
     var lines = [];
 
-    function paint() {
-        box.textContent = lines.join('\n');
-    }
+    function paint() { try { box.textContent = lines.join('\n'); } catch (e) {} }
 
-    function log(msg, color) {
+    function log(msg) {
         var t = new Date().toLocaleTimeString();
-        var line = (color ? '' : '') + t + '  ' + msg;
-        lines.push(line);
+        lines.push(t + '  ' + msg);
         if (lines.length > MAX_LINES) lines = lines.slice(-MAX_LINES);
         paint();
         try { console.log('[MIDBG]', msg); } catch (e) {}
@@ -51,44 +42,53 @@
     function dump(label, obj) {
         var s;
         try { s = JSON.stringify(obj); } catch (e) { s = String(obj); }
-        if (s && s.length > 600) s = s.slice(0, 600) + '…';
+        if (s && s.length > 700) s = s.slice(0, 700) + '…';
         log(label + ': ' + s);
     }
 
-    function attach() {
-        if (document.body) {
-            document.body.appendChild(box);
-            log(VERSION + ' loaded');
-            envInfo();
-        } else {
-            setTimeout(attach, 200);
-        }
+    /* ── ключевое: локальный guard вместо global onerror ─────── */
+
+    function guard(label, fn) {
+        return function () {
+            try { return fn.apply(this, arguments); }
+            catch (e) {
+                log('✗ ' + label + ': ' + (e && e.message ? e.message : e));
+                if (e && e.stack) log('  stack: ' + String(e.stack).split('\n').slice(0, 3).join(' | '));
+            }
+        };
     }
 
-    /* ── глобальные ошибки (ловим «Script error.») ───────────── */
+    function run(label, fn) { return guard(label, fn)(); }
 
+    /* ── глобальный onerror — только счётчик (детали скрыты) ──── */
+
+    var masked = 0;
     window.addEventListener('error', function (e) {
-        log('!! window.error: ' + (e.message || '') +
-            ' @' + (e.filename || '') + ':' + (e.lineno || ''));
+        // cross-origin → message == "Script error.", без файла/строки
+        if (!e.filename && (!e.message || /script error/i.test(e.message))) {
+            masked++;
+            // не спамим: обновляем одну строку через метку
+            log('(cross-origin onerror #' + masked + ' — детали скрыты браузером)');
+        } else {
+            log('!! onerror: ' + (e.message || '') + ' @' + (e.filename || '') + ':' + (e.lineno || ''));
+        }
     });
     window.addEventListener('unhandledrejection', function (e) {
-        log('!! promise reject: ' + ((e.reason && e.reason.message) || e.reason || ''));
+        log('!! reject: ' + ((e.reason && e.reason.message) || e.reason || ''));
     });
 
     /* ── окружение ───────────────────────────────────────────── */
 
-    function safe(fn, def) {
-        try { return fn(); } catch (e) { return def + ' (err:' + e.message + ')'; }
-    }
-
     function envInfo() {
-        log('platform.android: ' + safe(function () { return Lampa.Platform.is('android'); }, '?'));
-        log('internal_torrclient: ' + safe(function () { return Lampa.Storage.field('internal_torrclient'); }, '?'));
-        log('Torserver.url(): ' + safe(function () { return Lampa.Torserver.url() || '(пусто)'; }, '?'));
-        log('storage torrserver_url: ' + safe(function () { return Lampa.Storage.get('torrserver_url') || '(пусто)'; }, '?'));
-        log('storage torrserver_url_two: ' + safe(function () { return Lampa.Storage.get('torrserver_url_two') || '(пусто)'; }, '?'));
+        function s(fn) { try { var v = fn(); return (v === '' || v == null) ? '(пусто)' : v; } catch (e) { return 'ERR:' + e.message; } }
+        log('platform.android: '       + s(function () { return Lampa.Platform.is('android'); }));
+        log('internal_torrclient: '    + s(function () { return Lampa.Storage.field('internal_torrclient'); }));
+        log('Torserver exists: '       + s(function () { return !!Lampa.Torserver; }));
+        log('Torserver.url(): '        + s(function () { return Lampa.Torserver.url(); }));
+        log('storage torrserver_url: ' + s(function () { return Lampa.Storage.get('torrserver_url'); }));
+        log('storage url_two: '        + s(function () { return Lampa.Storage.get('torrserver_url_two'); }));
         log('UA: ' + navigator.userAgent);
-        log('--- жду событие torrent / torrent_file ---');
+        log('--- жду torrent / torrent_file ---');
     }
 
     /* ── разбор element ──────────────────────────────────────── */
@@ -99,93 +99,85 @@
         return m ? m[1] : null;
     }
 
+    var hash_tried = false;
+
     function inspect(tag, el) {
         if (!el) { log(tag + ': element пустой'); return; }
 
         log('──────── ' + tag + ' ────────');
         log('keys: ' + Object.keys(el).join(','));
-        log('title: ' + (el.title || el.Title || '?'));
+        log('title: '   + (el.title || el.Title || '?'));
         log('Tracker: ' + (el.Tracker || el.tracker || '?'));
-        log('hash (lampa id): ' + el.hash);
+        log('hash(id): ' + el.hash);
         log('MagnetUri: ' + (el.MagnetUri || '(нет)'));
-        log('Link: ' + (el.Link || '(нет)'));
+        log('Link: '      + (el.Link || '(нет)'));
 
         var direct = btihFromMagnet(el.MagnetUri) || btihFromMagnet(el.Link);
-        if (direct) log('>> C: btih из ссылки регуляркой = ' + direct);
-        else log('>> C: btih из ссылки не вытащить (нужен резолв)');
+        if (direct) log('>> C: btih регуляркой = ' + direct);
+        else log('>> C: из ссылки не вытащить (нужен резолв)');
 
-        // A: пробуем Lampa.Torserver.hash()
         tryTorserverHash(el);
     }
 
-    var hash_tried = false;
-
     function tryTorserverHash(el) {
-        if (hash_tried) return;          // один раз за сессию, чтобы не спамить TorrServer
-        var url = safe(function () { return Lampa.Torserver.url(); }, '');
-        if (!url || String(url).indexOf('err:') === 0) {
-            log('>> A: пропуск — Torserver.url() пустой');
-            return;
-        }
+        if (hash_tried) return;
+        var url;
+        try { url = Lampa.Torserver.url(); } catch (e) { log('>> A: url() THROW ' + e.message); return; }
+        if (!url) { log('>> A: пропуск — Torserver.url() пустой'); return; }
+
         hash_tried = true;
-        log('>> A: вызываю Lampa.Torserver.hash() …');
-        try {
+        log('>> A: Lampa.Torserver.hash() → ' + url);
+
+        run('A:hash-call', function () {
             Lampa.Torserver.hash({
                 title: el.title || el.Title || 'debug',
                 link: el.MagnetUri || el.Link,
                 poster: el.poster || '',
                 data: {}
-            }, function (json) {
-                dump('>> A OK json', json);
-                if (json && json.hash) log('>> A: ХЭШ ПОЛУЧЕН = ' + json.hash);
-            }, function (err) {
+            },
+            guard('A:hash-ok', function (json) {
+                dump('>> A OK', json);
+                if (json && json.hash) log('>> A: ХЭШ = ' + json.hash);
+            }),
+            guard('A:hash-fail', function (err) {
                 log('>> A FAIL: ' + (typeof err === 'string' ? err : JSON.stringify(err)));
-            });
-        } catch (e) {
-            log('>> A THROW: ' + e.message);
-        }
+            }));
+        });
     }
 
-    /* ── подписки на события ─────────────────────────────────── */
+    /* ── подписки ────────────────────────────────────────────── */
 
-    if (window.Lampa && Lampa.Listener) {
+    run('init', function () {
+        if (!(window.Lampa && Lampa.Listener)) { log('Lampa.Listener не готов'); return; }
 
-        Lampa.Listener.follow('torrent', function (data) {
+        Lampa.Listener.follow('torrent', guard('ev:torrent', function (data) {
             log('event torrent / ' + data.type);
             if (data.type === 'onenter') inspect('torrent:onenter', data.element);
-            else if (data.type === 'render' && !hash_tried) {
-                // только лог, без вызова hash, чтобы render не спамил
-                var el = data.element || {};
-                // ничего тяжёлого — ждём onenter
-            }
-        });
+        }));
 
-        Lampa.Listener.follow('torrent_file', function (data) {
-            log('event torrent_file / ' + data.type + ' (РЕДКОСТЬ на TV!)');
-            if (data.element) {
-                dump('torrent_file el', {
-                    torrent_hash: data.element.torrent_hash,
-                    id: data.element.id,
-                    title: data.element.title,
-                    ffprobe_len: data.element.ffprobe && data.element.ffprobe.length
-                });
-            }
-        });
+        Lampa.Listener.follow('torrent_file', guard('ev:torrent_file', function (data) {
+            log('event torrent_file / ' + data.type + ' (редкость на TV)');
+            if (data.element) dump('tf el', {
+                torrent_hash: data.element.torrent_hash,
+                id: data.element.id,
+                title: data.element.title,
+                ffprobe_len: data.element.ffprobe && data.element.ffprobe.length
+            });
+        }));
 
-        log('подписки на torrent / torrent_file установлены');
-    } else {
-        // Lampa ещё не готова — ждём
-        var wait = setInterval(function () {
-            if (window.Lampa && Lampa.Listener) {
-                clearInterval(wait);
-                location.reload && null; // no-op
-            }
-        }, 300);
-    }
+        log('подписки установлены');
+    });
 
-    attach();
+    /* ── attach + старт ──────────────────────────────────────── */
 
-    /* ручной доступ из консоли при отладке */
-    window.MIDBG = { log: log, env: envInfo, clear: function () { lines = []; paint(); } };
+    (function attach() {
+        if (document.body) {
+            document.body.appendChild(box);
+            log(VERSION + ' loaded');
+            run('envInfo', envInfo);
+        } else setTimeout(attach, 200);
+    })();
+
+    window.MIDBG = { log: log, env: function () { run('env', envInfo); }, clear: function () { lines = []; paint(); } };
 
 })();
