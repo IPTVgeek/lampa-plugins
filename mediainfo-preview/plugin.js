@@ -3,23 +3,23 @@
 
     Lampa.Listener.follow('full', function (e) {
 
-        if (e.type !== 'start') return;
+        if (e.type !== 'complete') return;
 
-        console.log('FULL START', e);
+        console.log('[FULL COMPLETE]', e);
 
-        if (e.data && e.data.movie) {
+        setTimeout(function(){
 
-            var movie = e.data.movie;
-
-            Lampa.Noty.show(
-                'TMDB: ' +
-                movie.id +
-                ' | ' +
-                (movie.title || movie.name)
+            console.log(
+                'DESCRIPTION:',
+                $('.full-start__description').length
             );
 
-            console.log('MOVIE', movie);
-        }
+            console.log(
+                'BODY:',
+                $('.full-start').length
+            );
+
+        },1000);
     });
 
 })();
