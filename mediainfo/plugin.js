@@ -1,13 +1,39 @@
 (function () {
     'use strict';
 
-    var VERSION = '1.3';
+    var VERSION = '1.4';
     var HOST    = '185.204.0.61:8080';
     var cache   = {};
 
-    // показываем версию при загрузке
+    /* ── persistent debug log ────────────────────────────────── */
+
+    var logEl    = null;
+    var logLines = [];
+    var MAX_LOG  = 8;
+
+    function initLog() {
+        if (logEl) return;
+        logEl = document.createElement('div');
+        logEl.id = 'mi-log';
+        document.body.appendChild(logEl);
+    }
+
+    function miLog(msg) {
+        console.log('[MediaInfo] ' + msg);
+        try {
+            if (!logEl) initLog();
+            var ts = new Date().toTimeString().slice(0, 8);
+            logLines.push(ts + '  ' + msg);
+            if (logLines.length > MAX_LOG) logLines.shift();
+            logEl.innerHTML = logLines.map(function (l) {
+                return '<div>' + l.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</div>';
+            }).join('');
+        } catch (e) {}
+    }
+
+    // загрузка плагина
+    miLog('v' + VERSION + ' loaded');
     try { Lampa.Noty.show('MediaInfo v' + VERSION); } catch (e) {}
-    console.log('[MediaInfo] v' + VERSION + ' loaded');
 
     /* ── helpers ──────────────────────────────────────────────── */
 
@@ -40,19 +66,25 @@
         var index = el.id !== undefined ? el.id : 0;
         var key   = hash + '_' + index;
 
+        miLog('getInfo hash=' + (hash ? hash.slice(0,8) : 'NONE') + ' idx=' + index);
+
         // cache hit
         if (cache.hasOwnProperty(key)) {
+            miLog('cache hit');
             setTimeout(function () { callback(cache[key]); }, 0);
             return;
         }
 
         // fast path — Lampa already has ffprobe data
         if (el.ffprobe && Array.isArray(el.ffprobe) && el.ffprobe.length) {
+            miLog('ffprobe: ' + el.ffprobe.length + ' streams');
             var hit = { streams: el.ffprobe };
             cache[key] = hit;
             callback(hit);
             return;
         }
+
+        miLog('fetching from server...');
 
         var finished = false;
 
@@ -60,42 +92,57 @@
             if (finished) return;
             finished = true;
             cache[key] = result;
+            if (result && result.streams) miLog('done: ' + result.streams.length + ' streams');
+            else miLog('done: no streams');
             callback(result);
         }
 
-        // overall timeout
-        var globalTimer = setTimeout(function () { done(null); }, 10000);
+        var globalTimer = setTimeout(function () {
+            miLog('timeout 10s');
+            done(null);
+        }, 10000);
 
         function finish(result) {
             clearTimeout(globalTimer);
             done(result);
         }
 
-        // source A — HTTP REST (fast if server supports it)
-        fetchTimeout('http://' + HOST + '/api?hash=' + hash + '&index=' + index, 5000)
+        // source A — HTTP REST
+        var httpUrl = 'http://' + HOST + '/api?hash=' + hash + '&index=' + index;
+        miLog('HTTP ->' + HOST);
+        fetchTimeout(httpUrl, 5000)
             .then(function (r) { return r.json(); })
             .then(function (json) {
-                if (json && json.streams && json.streams.length) finish(json);
+                var n = json && json.streams ? json.streams.length : 0;
+                miLog('HTTP ok n=' + n);
+                if (n) finish(json);
             })
-            .catch(function () { /* silent, WS may still win */ });
+            .catch(function (e) { miLog('HTTP err: ' + (e && e.message || 'fail')); });
 
-        // source B — WebSocket (original method)
+        // source B — WebSocket
         try {
-            var ws    = new WebSocket('ws://' + HOST + '/?' + hash + '&index=' + index);
-            var wsTimer = setTimeout(function () { ws.close(); }, 8000);
+            var wsUrl = 'ws://' + HOST + '/?' + hash + '&index=' + index;
+            miLog('WS ->' + HOST);
+            var ws      = new WebSocket(wsUrl);
+            var wsTimer = setTimeout(function () {
+                miLog('WS timeout');
+                ws.close();
+            }, 8000);
 
+            ws.onopen    = function () { miLog('WS open'); };
             ws.onmessage = function (e) {
                 clearTimeout(wsTimer);
                 ws.close();
                 try {
                     var json = JSON.parse(e.data);
-                    if (json && json.streams && json.streams.length) finish(json);
-                } catch (ex) { /* ignore */ }
+                    var n = json && json.streams ? json.streams.length : 0;
+                    miLog('WS msg n=' + n);
+                    if (n) finish(json);
+                } catch (ex) { miLog('WS parse err'); }
             };
-
-            ws.onerror = function () { clearTimeout(wsTimer); };
-            ws.onclose = function () { clearTimeout(wsTimer); };
-        } catch (e) { /* WebSocket not available */ }
+            ws.onerror   = function () { miLog('WS error'); clearTimeout(wsTimer); };
+            ws.onclose   = function () { clearTimeout(wsTimer); };
+        } catch (e) { miLog('WS exception: ' + e.message); }
     }
 
     /* ── stream formatting ───────────────────────────────────── */
@@ -121,8 +168,11 @@
             if (a.codec_name)              p.push(a.codec_name.toUpperCase());
             if (a.channel_layout) {
                 var ch = a.channel_layout
-                    .replace('stereo', '2.0').replace('mono', '1.0')
-                    .replace('5.1(side)', '5.1').replace(/\s*\(side\)\s*/, '').trim();
+                    .replace('stereo', '2.0')
+                    .replace('mono',   '1.0')
+                    .replace('5.1(side)', '5.1')
+                    .replace(/\s*\(side\)\s*/, '')
+                    .trim();
                 if (ch) p.push(ch);
             }
             var bps = a.bit_rate || (a.tags && (a.tags.BPS || a.tags['BPS-eng']));
@@ -137,8 +187,10 @@
             if (s.tags && s.tags.language) p.push(s.tags.language.toUpperCase());
             if (s.codec_name) {
                 p.push(s.codec_name.toUpperCase()
-                    .replace('SUBRIP', 'SRT').replace('HDMV_PGS_SUBTITLE', 'PGS')
-                    .replace('MOV_TEXT', 'MOV').replace('DVB_SUBTITLE', 'DVB'));
+                    .replace('SUBRIP',            'SRT')
+                    .replace('HDMV_PGS_SUBTITLE', 'PGS')
+                    .replace('MOV_TEXT',          'MOV')
+                    .replace('DVB_SUBTITLE',      'DVB'));
             }
             var lbl = s.tags && (s.tags.title || s.tags.handler_name);
             if (lbl) p.push(lbl);
@@ -154,6 +206,7 @@
         item.find('.mi-block').remove();
         var lines = buildLines(streams);
         if (!lines.length) return;
+
         var html = '<div class="mi-block">';
         lines.forEach(function (l) {
             html += '<div class="mi-line mi-' + l.type + '">' + esc(l.text) + '</div>';
@@ -173,21 +226,25 @@
                 var p = [];
                 if (a.tags && a.tags.language) p.push(a.tags.language.toUpperCase());
                 if (a.codec_name) p.push(a.codec_name.toUpperCase());
-                if (a.channel_layout) p.push(a.channel_layout
-                    .replace('stereo','2.0').replace('mono','1.0')
-                    .replace('5.1(side)','5.1').replace(/\s*\(side\)\s*/,'').trim());
+                if (a.channel_layout) p.push(a.channel_layout.replace('stereo','2.0').replace('mono','1.0').replace('5.1(side)','5.1').replace(/\s*\(side\)\s*/,'').trim());
                 if (p.length) parts.push('♪ ' + p.join(' '));
             });
             subs.forEach(function (s) {
                 var lang = s.tags && s.tags.language ? s.tags.language.toUpperCase() : '';
                 if (lang) parts.push('T ' + lang);
             });
-            if (parts.length) Lampa.Noty.show(parts.join('  ·  '));
-        } catch (e) {}
+            if (parts.length) {
+                miLog('Noty: ' + parts.join(' | '));
+                Lampa.Noty.show(parts.join('  ·  '));
+            } else {
+                miLog('Noty: nothing to show');
+            }
+        } catch (e) { miLog('Noty err: ' + e.message); }
     }
 
-    // хук на запуск плеера — работает даже если torrent_file не стреляет
+    // хук на запуск плеера (Android TV)
     Lampa.Player.listener.follow('start', function (data) {
+        miLog('Player.start hash=' + (data.torrent_hash ? data.torrent_hash.slice(0,8) : 'none'));
         if (!data.torrent_hash) return;
         var lookup = { torrent_hash: data.torrent_hash, id: data.id || 0 };
         getInfo(lookup, function (result) {
@@ -195,15 +252,17 @@
         });
     });
 
-    // хук на список файлов — показывает инлайн в списке + Noty
+    // хук на список файлов торрента
     Lampa.Listener.follow('torrent_file', function (data) {
+        miLog('torrent_file type=' + data.type);
         if (data.type !== 'render') return;
 
         var el = data.element;
-        if (!el) return;
+        if (!el) { miLog('no element'); return; }
 
         var hash  = el.torrent_hash || el.hash || el.info_hash;
         var index = el.id !== undefined ? el.id : (el.file_index !== undefined ? el.file_index : 0);
+        miLog('render hash=' + (hash ? hash.slice(0,8) : 'NONE') + ' idx=' + index);
         if (!hash) return;
 
         var lookup = { torrent_hash: hash, id: index, ffprobe: el.ffprobe, path: el.path };
@@ -221,14 +280,19 @@
 
     /* ── styles ──────────────────────────────────────────────── */
 
-    $('<style>\
-.mi-block{margin-top:.55em;display:flex;flex-direction:column;gap:.2em;font-size:.82em;line-height:1.4;opacity:.82}\
-.mi-loading{opacity:.35;letter-spacing:.3em}\
-.mi-line{display:flex;gap:.45em;align-items:baseline;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\
-.mi-line::before{flex-shrink:0;opacity:.55;width:1.1em;text-align:center}\
-.mi-video::before{content:"▶"}\
-.mi-audio::before{content:"♪"}\
-.mi-sub::before{content:"T"}\
-</style>').appendTo('body');
+    var style = document.createElement('style');
+    style.textContent =
+        '#mi-log{position:fixed;bottom:0;left:0;right:0;z-index:99999;' +
+            'background:rgba(0,0,0,.85);color:#0f0;' +
+            'font-family:monospace;font-size:13px;line-height:1.6;' +
+            'padding:6px 14px;pointer-events:none;}' +
+        '.mi-block{margin-top:.55em;display:flex;flex-direction:column;gap:.2em;font-size:.82em;line-height:1.4;opacity:.82}' +
+        '.mi-loading{opacity:.35;letter-spacing:.3em}' +
+        '.mi-line{display:flex;gap:.45em;align-items:baseline;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+        '.mi-line::before{flex-shrink:0;opacity:.55;width:1.1em;text-align:center}' +
+        '.mi-video::before{content:"▶"}' +
+        '.mi-audio::before{content:"♪"}' +
+        '.mi-sub::before{content:"T"}';
+    document.head.appendChild(style);
 
 })();
