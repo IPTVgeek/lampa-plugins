@@ -2,15 +2,15 @@
     'use strict';
 
     /* ───────────────────────────────────────────────────────────
-       MEDIAINFO DEBUG v0.4 — добываем btih на Android TV
+       MEDIAINFO DEBUG v0.5 — добываем btih на Android TV
        nnmclub: MagnetUri нет, только parsemagnet (302).
-       Пробуем два канала через нативный AndroidJS.httpReq:
-         1) распечатать весь объект ошибки 302 (вдруг там Location)
-         2) локальный TorrServer (/echo, /torrents list) → готовый btih
+       Канал 1 (резолв 302) мёртв — натив не отдаёт Location.
+       Канал 2 (рабочий): локальный TorrServer 127.0.0.1:8090
+       (/echo, /torrents list) → готовый btih. Натив httpReq.
        Без патчей глобальных объектов.
        ─────────────────────────────────────────────────────────── */
 
-    var VERSION = 'v0.4';
+    var VERSION = 'v0.5';
     var HOST    = '185.204.0.61:8080';
     var TS_BASES = ['http://127.0.0.1:8090', 'http://localhost:8090', 'http://127.0.0.1:8080', 'http://127.0.0.1:9090'];
 
@@ -141,11 +141,16 @@
 
     /* ── канал 2: локальный TorrServer ───────────────────────── */
 
+    var ts_listed = false;
+
     function probeTS(movieTitle) {
         TS_BASES.forEach(function (base) {
             nativeReq(base + '/echo', 'text', false,
                 guard('ts-echo', function (resp) {
                     log('TS FOUND ' + base + ' /echo: ' + String(resp).slice(0, 30));
+                    if (ts_listed) return;
+                    ts_listed = true;
+                    head('TorrServer найден (' + base.replace('http://', '') + ')\nчитаю список торрентов…');
                     listTS(base, movieTitle, 0);
                 }),
                 function () { /* нет сервера на этом порту — тихо */ });
@@ -156,11 +161,12 @@
         nativeReq(base + '/torrents', 'json', JSON.stringify({ action: 'list' }),
             guard('ts-list', function (arr) {
                 if (!arr || !arr.length) {
-                    if (attempt < 4) return setTimeout(function () { listTS(base, movieTitle, attempt + 1); }, 1500);
+                    if (attempt < 5) return setTimeout(function () { listTS(base, movieTitle, attempt + 1); }, 1500);
+                    head('TorrServer пустой список');
                     return log('TS list пуст (' + base + ')');
                 }
                 log('TS list n=' + arr.length + ' @' + base);
-                arr.slice(0, 8).forEach(function (t) {
+                arr.slice(0, 10).forEach(function (t) {
                     log('  • ' + String(t.title || t.name || '').slice(0, 40) + ' | ' + (t.hash || ''));
                 });
                 var match = null;
@@ -171,11 +177,16 @@
                     });
                 }
                 if (!match) match = arr[arr.length - 1]; // самый свежий обычно последний
-                if (match && match.hash) solve(match.hash, 'TS:' + base.replace('http://', ''));
+                if (match && match.hash) {
+                    head('btih найден в TorrServer:\n' + String(match.title || '').slice(0, 40) + '\n' + match.hash);
+                    solve(match.hash, 'TS:' + base.replace('http://', ''));
+                } else {
+                    head('в списке TorrServer нет hash');
+                }
             }),
             function (jq, ex) {
-                if (attempt < 2) setTimeout(function () { listTS(base, movieTitle, attempt + 1); }, 1500);
-                else log('TS list ERR ' + base + ' ' + (ex || (jq && jq.status)));
+                if (attempt < 3) setTimeout(function () { listTS(base, movieTitle, attempt + 1); }, 1500);
+                else { head('TorrServer /torrents ошибка: ' + (ex || (jq && jq.status))); log('TS list ERR ' + base + ' ' + (ex || (jq && jq.status))); }
             });
     }
 
@@ -228,7 +239,7 @@
 
     window.MIDBG = {
         log: log,
-        reset: function () { handled = false; solved = false; head('сброс, выбери торрент'); },
+        reset: function () { handled = false; solved = false; ts_listed = false; head('сброс, выбери торрент'); },
         ts: function () { probeTS(''); },
         test: function (h) { solved = false; queryServer(h); }
     };
