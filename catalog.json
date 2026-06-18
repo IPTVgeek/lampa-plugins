@@ -4,5 +4,12 @@
     "version": "1.0.0",
     "author": "IPTVGeek",
     "url": "https://raw.githubusercontent.com/IPTVGeek/lampa-plugins/main/mediainfo-preview/plugin.js"
+  },
+  {
+    "name": "MediaInfo",
+    "version": "1.0.0",
+    "author": "IPTVGeek",
+    "description": "Shows audio tracks and subtitles for torrent files before playback",
+    "url": "https://raw.githubusercontent.com/IPTVGeek/lampa-plugins/main/mediainfo/plugin.js"
   }
 ]
