@@ -2,16 +2,16 @@
     'use strict';
 
     /* ───────────────────────────────────────────────────────────
-       MEDIAINFO DEBUG v0.12 — богатые бейджи дорожек (TV)
-       Индекс главного видеофайла берём через /torrents get и шлём
-       и в локальный /ffp, и в резервный 185 (точная высота/кодек).
+       MEDIAINFO DEBUG v0.13 — богатые бейджи дорожек (TV)
+       Разрешение классифицируем по ШИРИНЕ (широкоформат 3840x1606
+       это 4K, а не 1080p). Индекс видеофайла берём из /torrents get
+       (с ретраями, пока готов file_stats) и шлём в /ffp и 185.
        Источник: 127.0.0.1:8090 /ffp → резерв 185.204.0.61.
        Больше UNCENSORED: HDR10/DV/HLG, Atmos, кодеки и битрейты,
        формат субтитров. Очередь: авто верхние 8 + lazy по фокусу.
-       Без патчей глобальных объектов.
        ─────────────────────────────────────────────────────────── */
 
-    var VERSION    = 'v0.12';
+    var VERSION    = 'v0.13';
     var HOST185    = '185.204.0.61:8080';
     var TS_BASES   = ['http://127.0.0.1:8090', 'http://localhost:8090', 'http://127.0.0.1:8080'];
     var TS_BASE    = null;
@@ -60,12 +60,13 @@
         return isNaN(v) ? 0 : v;
     }
     function resLabel(v) {
-        var h = v.height || 0;
-        if (h >= 2000) return '4K';
-        if (h >= 1000) return '1080p';
-        if (h >= 700)  return '720p';
-        if (h >= 500)  return '576p';
-        return v.width && v.height ? v.width + 'x' + v.height : '';
+        var w = v.width || 0, h = v.height || 0;
+        // классифицируем по ширине (фильмы бывают широкоформатные, напр. 3840x1606)
+        if (w >= 3000 || h >= 1900) return '4K';
+        if (w >= 1800 || h >= 1000) return '1080p';
+        if (w >= 1200 || h >= 700)  return '720p';
+        if (w >= 900  || h >= 500)  return '480p';
+        return w && h ? w + 'x' + h : '';
     }
     function hdrLabel(v) {
         var ct = (v.color_transfer || '').toLowerCase();
@@ -149,10 +150,14 @@
         var pick = (vid[0] || arr[0]);
         return pick.id != null ? pick.id : 0;
     }
-    function getIndex(hash, cb) {
+    function getIndex(hash, attempt, cb) {
         nativeReq(TS_BASE + '/torrents', 'json', JSON.stringify({ action: 'get', hash: hash }),
-            guard('get', function (j) { cb(pickIndex(j && j.file_stats)); }),
-            function () { cb(0); });
+            guard('get', function (j) {
+                var fs = j && j.file_stats;
+                if ((!fs || !fs.length) && attempt < 4) return setTimeout(function () { getIndex(hash, attempt + 1, cb); }, 1500);
+                cb(pickIndex(fs));
+            }),
+            function () { if (attempt < 4) setTimeout(function () { getIndex(hash, attempt + 1, cb); }, 1500); else cb(0); });
     }
     function ffp(hash, idx, attempt, cb) {
         nativeReq(TS_BASE + '/ffp/' + hash + '/' + idx, 'json', false,
@@ -221,7 +226,7 @@
 
         function go(hash) {
             if (!hash) { finish(null); return; }
-            getIndex(hash, function (idx) {
+            getIndex(hash, 0, function (idx) {
                 ffp(hash, idx, 0, function (streams) {
                     if (streams && streams.length) { tsDrop(hash); finish(streams, 'ffp'); }
                     else { log('локальный ffp пуст → 185 idx=' + idx); probe185(hash, idx, function (s2) { tsDrop(hash); finish(s2, '185'); }); }
