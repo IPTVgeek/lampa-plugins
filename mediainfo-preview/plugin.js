@@ -1,22 +1,38 @@
-
 (function () {
     'use strict';
 
     function init() {
-        // Выводит всплывающее уведомление на экран в самом интерфейсе Lampa
-        Lampa.Noty.show('Плагин MediaInfo Preview успешно загружен!');
-        
-        // Выводит строку в консоль разработчика (для отладки)
-        console.log('[Lampa Plugin] mediainfo-preview: Loaded successfully');
+        Lampa.Noty.show('MediaInfo Preview Debug загружен');
+
+        console.log('[MediaInfo Preview] plugin started');
+
+        Lampa.Listener.follow('full', function (e) {
+            console.log('[FULL EVENT]', e);
+
+            try {
+                Lampa.Noty.show('FULL: ' + (e.data?.movie?.title || e.data?.movie?.name || 'unknown'));
+            }
+            catch (err) {
+                console.log(err);
+            }
+        });
+
+        Lampa.Listener.follow('activity', function (e) {
+            console.log('[ACTIVITY EVENT]', e);
+        });
+
+        Lampa.Listener.follow('torrent_file', function (e) {
+            console.log('[TORRENT FILE EVENT]', e);
+        });
     }
 
-    // Если Lampa уже загружена — запускаем сразу
     if (window.lampa_started) {
         init();
-    } else {
-        // Если еще нет — ждем события готовности (ready)
+    }
+    else {
         Lampa.Listener.follow('app', function (e) {
             if (e.type === 'ready') init();
         });
     }
+
 })();
