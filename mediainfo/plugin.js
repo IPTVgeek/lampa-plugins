@@ -174,21 +174,15 @@
         var el = data.element;
         if (!el || !el.torrent_hash) return;
 
-        var item    = data.item;
-        var fetched = false;
+        var item = data.item;
 
-        item.on('hover:focus', function () {
-            if (fetched) return;
-            fetched = true;
+        item.append('<div class="mi-block mi-loading">···</div>');
 
-            item.append('<div class="mi-block mi-loading">···</div>');
-
-            getInfo(el, function (result) {
-                item.find('.mi-block').remove();
-                if (result && result.streams && result.streams.length) {
-                    renderInfo(item, result.streams);
-                }
-            });
+        getInfo(el, function (result) {
+            item.find('.mi-block').remove();
+            if (result && result.streams && result.streams.length) {
+                renderInfo(item, result.streams);
+            }
         });
     });
 
