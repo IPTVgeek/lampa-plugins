@@ -2,60 +2,49 @@
     'use strict';
 
     /* ───────────────────────────────────────────────────────────
-       MEDIAINFO DEBUG v0.8 — Android TV
-       btih: из локального TorrServer 127.0.0.1:8090 /torrents (работает).
-       Дорожки: сервер треков 185.204.0.61 — HTTP /api (кэш) + WebSocket
-       (запускает анализ). Логируем protocol для оценки mixed-content.
+       MEDIAINFO DEBUG v0.9 — бейджи дорожек в списке торрентов (TV)
+       Источник btih на строку:
+         1) element.ffprobe (если парсер уже дал) — бесплатно;
+         2) по фокусу строки: add→локальный TorrServer→btih→drop,
+            затем сервер треков 185.204.0.61 (HTTP кэш + WS анализ).
+       Плеер в списке не запущен → таймеры не мёрзнут.
        Без патчей глобальных объектов.
        ─────────────────────────────────────────────────────────── */
 
-    var VERSION = 'v0.8';
+    var VERSION = 'v0.9';
     var HOST    = '185.204.0.61:8080';
-    var TS_BASES = ['http://127.0.0.1:8090', 'http://localhost:8090', 'http://127.0.0.1:8080', 'http://127.0.0.1:9090'];
+    var TS_BASES = ['http://127.0.0.1:8090', 'http://localhost:8090', 'http://127.0.0.1:8080'];
+    var TS_BASE = null;
 
-    /* ── overlays ────────────────────────────────────────────── */
+    var cache = {};       // link -> {state:'pending'|'done', streams}
+    var focusTimer = null;
 
-    var top = mk('mi-top', 'top:0', '16px', '#FFD400');
-    var bot = mk('mi-log', 'bottom:0', '11px', '#7CFC00');
+    /* ── мини-лог ────────────────────────────────────────────── */
 
-    function mk(id, edge, fs, color) {
-        var d = document.createElement('div');
-        d.id = id;
-        d.style.cssText = [
-            'position:fixed', 'left:0', 'right:0', edge,
-            'max-height:46%', 'z-index:2147483647',
-            'background:rgba(0,0,0,.85)', 'color:' + color,
-            'font-family:monospace', 'font-size:' + fs, 'line-height:1.3',
-            'padding:.4em .7em', 'overflow:hidden',
-            'white-space:pre-wrap', 'word-break:break-all', 'pointer-events:none'
-        ].join(';');
-        return d;
-    }
-
+    var bot = document.createElement('div');
+    bot.id = 'mi-log';
+    bot.style.cssText = 'position:fixed;left:0;right:0;bottom:0;max-height:32%;z-index:2147483647;' +
+        'background:rgba(0,0,0,.8);color:#7CFC00;font-family:monospace;font-size:11px;line-height:1.3;' +
+        'padding:.3em .6em;overflow:hidden;white-space:pre-wrap;word-break:break-all;pointer-events:none';
     var blines = [];
     function log(m) {
-        var t = new Date().toTimeString().slice(0, 8);
-        blines.push(t + ' ' + m);
-        if (blines.length > 70) blines = blines.slice(-70);
+        blines.push(new Date().toTimeString().slice(0, 8) + ' ' + m);
+        if (blines.length > 40) blines = blines.slice(-40);
         try { bot.textContent = blines.join('\n'); } catch (e) {}
         try { console.log('[MIDBG]', m); } catch (e) {}
     }
-    function head(m) { try { top.textContent = 'MEDIAINFO ' + VERSION + '\n' + m; } catch (e) {} }
 
     function guard(label, fn) {
-        return function () {
-            try { return fn.apply(this, arguments); }
-            catch (e) { log('✗ ' + label + ': ' + (e && e.message ? e.message : e)); }
-        };
+        return function () { try { return fn.apply(this, arguments); } catch (e) { log('✗ ' + label + ': ' + (e && e.message ? e.message : e)); } };
     }
-    function run(label, fn) { return guard(label, fn)(); }
 
-    window.addEventListener('error', function (e) {
-        if (e.filename || (e.message && !/script error/i.test(e.message)))
-            log('!! onerror: ' + (e.message || '') + ' @' + (e.filename || '') + ':' + (e.lineno || ''));
-    });
+    /* ── сеть (нативный httpReq на Android) ──────────────────── */
 
-    /* ── helpers ─────────────────────────────────────────────── */
+    function nativeReq(url, dataType, post, ok, err) {
+        var n = new Lampa.Reguest();
+        n.timeout(12000);
+        n.native(url, ok, err, post || false, { dataType: dataType || 'text' });
+    }
 
     function extractHash(s) {
         if (!s) return null;
@@ -66,66 +55,9 @@
         return null;
     }
 
-    function nativeReq(url, dataType, post, ok, err) {
-        var n = new Lampa.Reguest();
-        n.timeout(12000);
-        n.native(url, ok, err, post || false, { dataType: dataType || 'text' });
-    }
+    /* ── формат бейджа ───────────────────────────────────────── */
 
-    var solved = false;
-    function solve(hash, where) {
-        if (solved) return;
-        solved = true;
-        log('✔ btih (' + where + ') = ' + hash);
-        queryServer(hash);
-    }
-
-    /* ── сервер треков (HTTP кэш + WebSocket анализ) ──────────── */
-
-    function queryServer(hash) {
-        log('page protocol=' + location.protocol + ' href=' + location.href.slice(0, 40));
-        head('btih=' + hash.slice(0, 12) + '…\nспрашиваю сервер треков (HTTP+WS)…');
-
-        // канал HTTP (быстрый, только если хэш уже в кэше сервера)
-        var url = 'http://' + HOST + '/api?hash=' + hash + '&index=0';
-        log('HTTP → ' + url);
-        nativeReq(url, 'json', false,
-            guard('srv-ok', function (json) {
-                var s = json && json.streams;
-                log('HTTP streams = ' + (s ? s.length : 0));
-                if (s && s.length) showTracks(s);
-            }),
-            guard('srv-err', function (jq, ex) {
-                log('HTTP ERR: ' + (ex || '') + ' status=' + (jq && jq.status));
-            }));
-
-        // канал WebSocket (запускает анализ на сервере) — основной
-        wsQuery(hash);
-    }
-
-    function wsQuery(hash) {
-        var wsurl = 'ws://' + HOST + '/?' + hash + '&index=0';
-        log('WS → ' + wsurl);
-        try {
-            var ws = new WebSocket(wsurl);
-            var t = setTimeout(function () { try { ws.close(); } catch (e) {} log('WS timeout'); }, 25000);
-            ws.onopen = function () { log('WS open'); };
-            ws.onmessage = guard('ws-msg', function (e) {
-                var raw = String(e.data || '');
-                log('WS msg[' + raw.length + ']: ' + raw.slice(0, 80));
-                var json; try { json = JSON.parse(raw); } catch (ex) { return; }
-                var s = json && json.streams;
-                if (s && s.length) { clearTimeout(t); try { ws.close(); } catch (e) {} showTracks(s); }
-            });
-            ws.onerror = function () { log('WS error (mixed-content? ' + location.protocol + ')'); };
-            ws.onclose = function (e) { clearTimeout(t); log('WS close code=' + (e && e.code)); };
-        } catch (e) {
-            log('WS throw: ' + e.message);
-            head('WebSocket недоступен: ' + e.message);
-        }
-    }
-
-    function showTracks(streams) {
+    function summarize(streams) {
         var audio = streams.filter(function (s) { return s.codec_type === 'audio'; });
         var subs  = streams.filter(function (s) { return s.codec_type === 'subtitle'; });
         var parts = [];
@@ -133,152 +65,164 @@
             var p = [];
             if (a.tags && a.tags.language) p.push(a.tags.language.toUpperCase());
             if (a.codec_name) p.push(a.codec_name.toUpperCase());
-            if (a.channel_layout) p.push(a.channel_layout.replace('stereo', '2.0').replace('mono', '1.0'));
+            if (a.channel_layout) p.push(a.channel_layout.replace('stereo', '2.0').replace('mono', '1.0').replace('(side)', ''));
             parts.push('♪ ' + p.join(' '));
         });
-        subs.forEach(function (s) {
-            parts.push('T ' + (s.tags && s.tags.language ? s.tags.language.toUpperCase() : (s.codec_name || 'SUB')));
-        });
-        var txt = parts.length ? parts.join('   ') : 'дорожек нет';
-        head('✓ РАБОТАЕТ\n' + txt);
-        log('TRACKS: ' + txt);
-        try { Lampa.Noty.show(txt); } catch (e) {}
+        var sl = [];
+        subs.forEach(function (s) { if (s.tags && s.tags.language) sl.push(s.tags.language.toUpperCase()); });
+        sl = sl.filter(function (v, i) { return sl.indexOf(v) === i; });
+        if (sl.length) parts.push('T ' + sl.join('/'));
+        return parts;
     }
 
-    /* ── канал 1: резолв parsemagnet, печать всего объекта ───── */
+    function renderBadge(item, streams) {
+        try {
+            item.find('.mi-badge').remove();
+            var parts = summarize(streams);
+            if (!parts.length) return;
+            var html = '<div class="mi-badge">' + parts.map(function (p) {
+                return '<span>' + p.replace(/</g, '&lt;') + '</span>';
+            }).join('') + '</div>';
+            item.append(html);
+        } catch (e) { log('badge err: ' + e.message); }
+    }
 
-    function resolveLink(link) {
-        log('resolve → ' + link.slice(0, 70));
-        nativeReq(link, 'text', false,
-            guard('res-ok', function (resp) {
-                var str = typeof resp === 'string' ? resp : JSON.stringify(resp);
-                log('res OK[' + (str ? str.length : 0) + ']: ' + (str || '').slice(0, 90));
-                var h = extractHash(str);
-                if (h) solve(h, 'body'); else log('в теле btih нет');
+    function loading(item, on) {
+        try {
+            item.find('.mi-badge').remove();
+            if (on) item.append('<div class="mi-badge mi-load">···</div>');
+        } catch (e) {}
+    }
+
+    /* ── сервер треков ───────────────────────────────────────── */
+
+    function queryTracks(hash, cb) {
+        var got = false;
+        function done(streams) { if (got) return; got = true; cb(streams); }
+
+        nativeReq('http://' + HOST + '/api?hash=' + hash + '&index=0', 'json', false,
+            guard('http-ok', function (json) {
+                if (json && json.streams && json.streams.length) { log('HTTP кэш hit'); done(json.streams); }
             }),
-            guard('res-err', function (jq, ex) {
-                var full;
-                try { full = JSON.stringify(jq); } catch (e) { full = String(jq); }
-                log('res ERR ex=' + ex + ' full=' + (full || '').slice(0, 200));
-                var h = extractHash(full);
-                if (h) solve(h, 'err-obj'); else log('в объекте 302 btih нет');
-            }));
-    }
+            function () {});
 
-    /* ── канал 2: локальный TorrServer ───────────────────────── */
-
-    var ts_listed = false;
-
-    function probeTS(movieTitle) {
-        TS_BASES.forEach(function (base) {
-            nativeReq(base + '/echo', 'text', false,
-                guard('ts-echo', function (resp) {
-                    log('TS FOUND ' + base + ' /echo: ' + String(resp).slice(0, 30));
-                    if (ts_listed) return;
-                    ts_listed = true;
-                    head('TorrServer найден (' + base.replace('http://', '') + ')\nчитаю список торрентов…');
-                    listTS(base, movieTitle, 0);
-                }),
-                function () { /* нет сервера на этом порту — тихо */ });
-        });
-    }
-
-    function listTS(base, movieTitle, attempt) {
-        log('TS list try#' + attempt + ' @' + base);
-        nativeReq(base + '/torrents', 'json', JSON.stringify({ action: 'list' }),
-            guard('ts-list', function (arr) {
-                log('TS resp type=' + (Array.isArray(arr) ? 'array[' + arr.length + ']' : typeof arr));
-                if (arr && !Array.isArray(arr)) {
-                    if (Array.isArray(arr.torrents)) arr = arr.torrents;
-                    else log('TS resp raw: ' + JSON.stringify(arr).slice(0, 140));
-                }
-                if (!arr || !arr.length) {
-                    if (attempt < 12) {
-                        head('TorrServer (' + base.replace('http://', '') + ')\nсписок пуст, жду торрент… #' + (attempt + 1));
-                        return setTimeout(function () { listTS(base, movieTitle, attempt + 1); }, 1200);
-                    }
-                    head('TorrServer список так и пуст\n(торрент не появился за ~15с)');
-                    return log('TS list пуст после ретраев (' + base + ')');
-                }
-                log('TS list n=' + arr.length + ' @' + base);
-                arr.slice(0, 10).forEach(function (t) {
-                    log('  • ' + String(t.title || t.name || '').slice(0, 40) + ' | ' + (t.hash || ''));
-                });
-                var match = null;
-                if (movieTitle) {
-                    var mt = movieTitle.toLowerCase();
-                    match = arr.find(function (t) {
-                        return (t.title || t.name || '').toLowerCase().indexOf(mt) >= 0;
-                    });
-                }
-                if (!match) match = arr[arr.length - 1]; // самый свежий обычно последний
-                if (match && match.hash) {
-                    head('btih найден в TorrServer:\n' + String(match.title || '').slice(0, 40) + '\n' + match.hash);
-                    solve(match.hash, 'TS:' + base.replace('http://', ''));
-                } else {
-                    head('в списке TorrServer нет hash');
-                }
-            }),
-            function (jq, ex) {
-                var info = (ex || '') + ' status=' + (jq && jq.status);
-                log('TS list ERR#' + attempt + ' ' + base + ' ' + info);
-                if (attempt < 4) setTimeout(function () { listTS(base, movieTitle, attempt + 1); }, 1500);
-                else head('TorrServer /torrents ошибка:\n' + info);
+        try {
+            var ws = new WebSocket('ws://' + HOST + '/?' + hash + '&index=0');
+            var t = setTimeout(function () { try { ws.close(); } catch (e) {} if (!got) done(null); }, 25000);
+            ws.onmessage = guard('ws', function (e) {
+                var j; try { j = JSON.parse(String(e.data || '')); } catch (ex) { return; }
+                if (j && j.streams && j.streams.length) { clearTimeout(t); try { ws.close(); } catch (e) {} log('WS анализ ok'); done(j.streams); }
             });
+            ws.onerror = function () { log('WS error proto=' + location.protocol); };
+        } catch (e) { log('WS throw ' + e.message); }
     }
 
-    /* ── вход ────────────────────────────────────────────────── */
+    /* ── локальный TorrServer: add → hash → drop ─────────────── */
 
-    var handled = false;
+    function tsAdd(link, cb) {
+        if (!TS_BASE) { cb(null); return; }
+        nativeReq(TS_BASE + '/torrents', 'json',
+            JSON.stringify({ action: 'add', link: link, title: '[mi-probe]', save_to_db: false }),
+            guard('ts-add', function (json) {
+                var h = json && (json.hash || (json.torrent && json.torrent.hash));
+                log('TS add → ' + (h ? h.slice(0, 12) : 'нет hash'));
+                cb(h || null);
+            }),
+            function (jq, ex) { log('TS add ERR ' + (ex || (jq && jq.status))); cb(null); });
+    }
 
-    function onEnter(el) {
-        if (handled) return;
-        handled = true;
-        if (!el) { log('onenter: пусто'); return; }
+    function tsDrop(hash) {
+        if (!TS_BASE || !hash) return;
+        nativeReq(TS_BASE + '/torrents', 'text', JSON.stringify({ action: 'drop', hash: hash }), function () {}, function () {});
+    }
 
-        log('──── onenter ────');
-        log('MagnetUri: ' + (el.MagnetUri || '(нет)'));
-        log('Link: ' + (el.Link || '(нет)'));
+    /* ── резолв одной строки ─────────────────────────────────── */
 
-        var movieTitle = '';
-        try { movieTitle = (Lampa.Activity.active().movie || {}).title || ''; } catch (e) {}
-        log('movie.title = ' + (movieTitle || '(нет)'));
+    function resolveRow(element, item) {
+        var link = element.Link || element.link || element.MagnetUri || element.url;
+        if (!link) return;
 
-        var direct = extractHash(el.MagnetUri) || extractHash(el.Link);
-        if (direct) { head('C: btih из ссылки\nстучусь на сервер…'); solve(direct, 'link'); }
-        else head('btih в ссылке нет → резолв + локальный TorrServer');
+        if (cache[link]) {
+            if (cache[link].state === 'done') renderBadge(item, cache[link].streams);
+            return;
+        }
+        cache[link] = { state: 'pending' };
+        loading(item, true);
+        log('резолв: ' + (element.Title || element.title || '').slice(0, 30));
 
-        // канал 1
-        var link = el.Link || el.link || el.url || el.MagnetUri;
-        if (!direct && link) resolveLink(link);
+        var direct = extractHash(element.MagnetUri) || extractHash(element.Link);
+        function withHash(hash) {
+            if (!hash) { loading(item, false); cache[link] = null; return; }
+            queryTracks(hash, function (streams) {
+                tsDrop(hash);
+                loading(item, false);
+                if (streams && streams.length) {
+                    cache[link] = { state: 'done', streams: streams };
+                    renderBadge(item, streams);
+                    log('бейдж готов: ' + summarize(streams).join(' '));
+                } else {
+                    cache[link] = null;
+                    log('сервер треков не дал дорожек');
+                }
+            });
+        }
 
-        // канал 2
-        if (!direct) probeTS(movieTitle);
+        if (direct) withHash(direct);
+        else tsAdd(link, withHash);
+    }
+
+    /* ── подписки ────────────────────────────────────────────── */
+
+    function onRender(element, item) {
+        // 1) бесплатно из парсера
+        if (element.ffprobe && element.ffprobe.length) {
+            renderBadge(item, element.ffprobe);
+            return;
+        }
+        // 2) по фокусу — резолв через TorrServer + сервер треков
+        try {
+            item.on('hover:focus', guard('focus', function () {
+                clearTimeout(focusTimer);
+                focusTimer = setTimeout(function () { resolveRow(element, item); }, 450);
+            }));
+        } catch (e) { log('bind focus err: ' + e.message); }
     }
 
     /* ── init ────────────────────────────────────────────────── */
 
-    run('init', function () {
+    function detectTS(done) {
+        var left = TS_BASES.length;
+        TS_BASES.forEach(function (base) {
+            nativeReq(base + '/echo', 'text', false,
+                guard('echo', function (resp) {
+                    if (!TS_BASE) { TS_BASE = base; log('TorrServer: ' + base + ' (' + String(resp).slice(0, 12) + ')'); done && done(); done = null; }
+                }),
+                function () { if (--left === 0 && !TS_BASE) { log('TorrServer не найден'); done && done(); } });
+        });
+    }
+
+    guard('init', function () {
         document.body.appendChild(bot);
-        document.body.appendChild(top);
-        head('загружен, выбери торрент');
-        log(VERSION + ' loaded');
-        log('AndroidJS=' + (typeof AndroidJS) + ' httpReq=' + (typeof AndroidJS !== 'undefined' ? typeof AndroidJS.httpReq : '-'));
+        log(VERSION + ' loaded; AndroidJS=' + (typeof AndroidJS));
+        var style = document.createElement('style');
+        style.textContent =
+            '.mi-badge{display:flex;flex-wrap:wrap;gap:.4em;margin-top:.4em;font-size:.78em;opacity:.9}' +
+            '.mi-badge span{background:rgba(124,252,0,.15);border:1px solid rgba(124,252,0,.5);' +
+            'border-radius:.3em;padding:.05em .4em;white-space:nowrap}' +
+            '.mi-load{opacity:.4;letter-spacing:.3em}';
+        document.head.appendChild(style);
+
+        detectTS();
 
         if (!(window.Lampa && Lampa.Listener)) { log('Lampa.Listener нет'); return; }
 
         Lampa.Listener.follow('torrent', guard('ev', function (data) {
-            if (data.type === 'onenter') onEnter(data.element);
+            if (data.type === 'render' && data.element && data.item) onRender(data.element, data.item);
         }));
 
-        log('жду onenter');
-    });
+        log('подписка на torrent/render установлена');
+    })();
 
-    window.MIDBG = {
-        log: log,
-        reset: function () { handled = false; solved = false; ts_listed = false; head('сброс, выбери торрент'); },
-        ts: function () { probeTS(''); },
-        test: function (h) { solved = false; queryServer(h); }
-    };
+    window.MIDBG = { log: log, clearCache: function () { cache = {}; log('cache cleared'); } };
 
 })();
