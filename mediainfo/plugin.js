@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '1.2';
+    var VERSION = '1.3';
     var HOST    = '185.204.0.61:8080';
     var cache   = {};
 
@@ -106,7 +106,6 @@
         var subs  = streams.filter(function (s) { return s.codec_type === 'subtitle'; });
         var lines = [];
 
-        // video — one line
         video.slice(0, 1).forEach(function (v) {
             var p = [];
             if (v.width && v.height)  p.push(v.width + '×' + v.height);
@@ -116,18 +115,14 @@
             if (p.length) lines.push({ type: 'video', text: p.join(' · ') });
         });
 
-        // audio tracks
         audio.forEach(function (a) {
             var p = [];
             if (a.tags && a.tags.language) p.push(a.tags.language.toUpperCase());
             if (a.codec_name)              p.push(a.codec_name.toUpperCase());
             if (a.channel_layout) {
                 var ch = a.channel_layout
-                    .replace('stereo', '2.0')
-                    .replace('mono',   '1.0')
-                    .replace('5.1(side)', '5.1')
-                    .replace(/\s*\(side\)\s*/, '')
-                    .trim();
+                    .replace('stereo', '2.0').replace('mono', '1.0')
+                    .replace('5.1(side)', '5.1').replace(/\s*\(side\)\s*/, '').trim();
                 if (ch) p.push(ch);
             }
             var bps = a.bit_rate || (a.tags && (a.tags.BPS || a.tags['BPS-eng']));
@@ -137,16 +132,13 @@
             lines.push({ type: 'audio', text: p.join(' · ') || '—' });
         });
 
-        // subtitle tracks
         subs.forEach(function (s) {
             var p = [];
             if (s.tags && s.tags.language) p.push(s.tags.language.toUpperCase());
             if (s.codec_name) {
                 p.push(s.codec_name.toUpperCase()
-                    .replace('SUBRIP',            'SRT')
-                    .replace('HDMV_PGS_SUBTITLE', 'PGS')
-                    .replace('MOV_TEXT',          'MOV')
-                    .replace('DVB_SUBTITLE',      'DVB'));
+                    .replace('SUBRIP', 'SRT').replace('HDMV_PGS_SUBTITLE', 'PGS')
+                    .replace('MOV_TEXT', 'MOV').replace('DVB_SUBTITLE', 'DVB'));
             }
             var lbl = s.tags && (s.tags.title || s.tags.handler_name);
             if (lbl) p.push(lbl);
@@ -162,7 +154,6 @@
         item.find('.mi-block').remove();
         var lines = buildLines(streams);
         if (!lines.length) return;
-
         var html = '<div class="mi-block">';
         lines.forEach(function (l) {
             html += '<div class="mi-line mi-' + l.type + '">' + esc(l.text) + '</div>';
@@ -182,7 +173,9 @@
                 var p = [];
                 if (a.tags && a.tags.language) p.push(a.tags.language.toUpperCase());
                 if (a.codec_name) p.push(a.codec_name.toUpperCase());
-                if (a.channel_layout) p.push(a.channel_layout.replace('stereo','2.0').replace('mono','1.0').replace('5.1(side)','5.1').replace(/\s*\(side\)\s*/,'').trim());
+                if (a.channel_layout) p.push(a.channel_layout
+                    .replace('stereo','2.0').replace('mono','1.0')
+                    .replace('5.1(side)','5.1').replace(/\s*\(side\)\s*/,'').trim());
                 if (p.length) parts.push('♪ ' + p.join(' '));
             });
             subs.forEach(function (s) {
@@ -193,13 +186,22 @@
         } catch (e) {}
     }
 
+    // хук на запуск плеера — работает даже если torrent_file не стреляет
+    Lampa.Player.listener.follow('start', function (data) {
+        if (!data.torrent_hash) return;
+        var lookup = { torrent_hash: data.torrent_hash, id: data.id || 0 };
+        getInfo(lookup, function (result) {
+            if (result && result.streams && result.streams.length) showNoty(result.streams);
+        });
+    });
+
+    // хук на список файлов — показывает инлайн в списке + Noty
     Lampa.Listener.follow('torrent_file', function (data) {
         if (data.type !== 'render') return;
 
         var el = data.element;
         if (!el) return;
 
-        // поддержка разных версий Lampa
         var hash  = el.torrent_hash || el.hash || el.info_hash;
         var index = el.id !== undefined ? el.id : (el.file_index !== undefined ? el.file_index : 0);
         if (!hash) return;
@@ -212,11 +214,7 @@
         getInfo(lookup, function (result) {
             item.find('.mi-block').remove();
             if (!result || !result.streams || !result.streams.length) return;
-
-            // показываем в списке файлов
             renderInfo(item, result.streams);
-
-            // показываем уведомление — видно всегда (TV, предзагрузка и т.д.)
             showNoty(result.streams);
         });
     });
