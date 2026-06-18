@@ -2,17 +2,16 @@
     'use strict';
 
     /* ───────────────────────────────────────────────────────────
-       MEDIAINFO DEBUG v0.11 — богатые бейджи из локального TorrServer
-       Источник: 127.0.0.1:8090
-         add(link)→btih → /torrents get (выбрать видеофайл) →
-         /ffp/{hash}/{index} → полный ffprobe.
-       Показываем больше UNCENSORED: HDR10/DV/HLG, Atmos, точные
-       кодеки и битрейты видео/аудио, формат субтитров.
-       Резерв: чужой 185.204.0.61 (если в сборке нет ffprobe).
-       Очередь: авто верхние 8 + lazy по фокусу. Без патчей globals.
+       MEDIAINFO DEBUG v0.12 — богатые бейджи дорожек (TV)
+       Индекс главного видеофайла берём через /torrents get и шлём
+       и в локальный /ffp, и в резервный 185 (точная высота/кодек).
+       Источник: 127.0.0.1:8090 /ffp → резерв 185.204.0.61.
+       Больше UNCENSORED: HDR10/DV/HLG, Atmos, кодеки и битрейты,
+       формат субтитров. Очередь: авто верхние 8 + lazy по фокусу.
+       Без патчей глобальных объектов.
        ─────────────────────────────────────────────────────────── */
 
-    var VERSION    = 'v0.11';
+    var VERSION    = 'v0.12';
     var HOST185    = '185.204.0.61:8080';
     var TS_BASES   = ['http://127.0.0.1:8090', 'http://localhost:8090', 'http://127.0.0.1:8080'];
     var TS_BASE    = null;
@@ -132,7 +131,7 @@
     }
     function loading(item, on) { try { item.find('.mi-badge').remove(); if (on) item.append('<div class="mi-badge mi-load">···</div>'); } catch (e) {} }
 
-    /* ── локальный TorrServer: add → get → ffp → drop ────────── */
+    /* ── локальный TorrServer: add → get index → ffp → drop ──── */
     function tsAdd(link, cb) {
         nativeReq(TS_BASE + '/torrents', 'json',
             JSON.stringify({ action: 'add', link: link, title: '[mi-probe]', save_to_db: false }),
@@ -150,6 +149,11 @@
         var pick = (vid[0] || arr[0]);
         return pick.id != null ? pick.id : 0;
     }
+    function getIndex(hash, cb) {
+        nativeReq(TS_BASE + '/torrents', 'json', JSON.stringify({ action: 'get', hash: hash }),
+            guard('get', function (j) { cb(pickIndex(j && j.file_stats)); }),
+            function () { cb(0); });
+    }
     function ffp(hash, idx, attempt, cb) {
         nativeReq(TS_BASE + '/ffp/' + hash + '/' + idx, 'json', false,
             guard('ffp', function (j) {
@@ -163,23 +167,15 @@
                 cb(null, 'ffp-fail');
             });
     }
-    function probeLocal(hash, cb) {
-        nativeReq(TS_BASE + '/torrents', 'json', JSON.stringify({ action: 'get', hash: hash }),
-            guard('get', function (j) {
-                var idx = pickIndex(j && j.file_stats);
-                ffp(hash, idx, 0, cb);
-            }),
-            function () { ffp(hash, 0, 0, cb); });
-    }
 
     /* ── резерв: 185 ─────────────────────────────────────────── */
-    function probe185(hash, cb) {
+    function probe185(hash, idx, cb) {
         var got = false;
         function done(s) { if (got) return; got = true; cb(s); }
-        nativeReq('http://' + HOST185 + '/api?hash=' + hash + '&index=0', 'json', false,
+        nativeReq('http://' + HOST185 + '/api?hash=' + hash + '&index=' + idx, 'json', false,
             guard('185http', function (j) { if (j && j.streams && j.streams.length) done(j.streams); }), function () {});
         try {
-            var ws = new WebSocket('ws://' + HOST185 + '/?' + hash + '&index=0');
+            var ws = new WebSocket('ws://' + HOST185 + '/?' + hash + '&index=' + idx);
             var t = setTimeout(function () { try { ws.close(); } catch (e) {} done(null); }, 22000);
             ws.onmessage = guard('185ws', function (e) {
                 var j; try { j = JSON.parse(String(e.data || '')); } catch (x) { return; }
@@ -225,9 +221,11 @@
 
         function go(hash) {
             if (!hash) { finish(null); return; }
-            probeLocal(hash, function (streams) {
-                if (streams && streams.length) { tsDrop(hash); finish(streams, 'ffp'); }
-                else { log('локальный ffp пуст → 185'); probe185(hash, function (s2) { tsDrop(hash); finish(s2, '185'); }); }
+            getIndex(hash, function (idx) {
+                ffp(hash, idx, 0, function (streams) {
+                    if (streams && streams.length) { tsDrop(hash); finish(streams, 'ffp'); }
+                    else { log('локальный ffp пуст → 185 idx=' + idx); probe185(hash, idx, function (s2) { tsDrop(hash); finish(s2, '185'); }); }
+                });
             });
         }
         if (direct) go(direct); else tsAdd(job.link, go);
