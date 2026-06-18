@@ -2,16 +2,14 @@
     'use strict';
 
     /* ───────────────────────────────────────────────────────────
-       MEDIAINFO DEBUG v0.7 — добываем btih на Android TV
-       nnmclub: MagnetUri нет, только parsemagnet (302).
-       Канал 1 (резолв 302) мёртв — натив не отдаёт Location.
-       Канал 2 (рабочий): локальный TorrServer 127.0.0.1:8090
-       (/echo, /torrents list) → готовый btih. Натив httpReq.
-       Список появляется не мгновенно — поллим до 12 раз.
+       MEDIAINFO DEBUG v0.8 — Android TV
+       btih: из локального TorrServer 127.0.0.1:8090 /torrents (работает).
+       Дорожки: сервер треков 185.204.0.61 — HTTP /api (кэш) + WebSocket
+       (запускает анализ). Логируем protocol для оценки mixed-content.
        Без патчей глобальных объектов.
        ─────────────────────────────────────────────────────────── */
 
-    var VERSION = 'v0.7';
+    var VERSION = 'v0.8';
     var HOST    = '185.204.0.61:8080';
     var TS_BASES = ['http://127.0.0.1:8090', 'http://localhost:8090', 'http://127.0.0.1:8080', 'http://127.0.0.1:9090'];
 
@@ -82,22 +80,49 @@
         queryServer(hash);
     }
 
-    /* ── сервер треков ───────────────────────────────────────── */
+    /* ── сервер треков (HTTP кэш + WebSocket анализ) ──────────── */
 
     function queryServer(hash) {
+        log('page protocol=' + location.protocol + ' href=' + location.href.slice(0, 40));
+        head('btih=' + hash.slice(0, 12) + '…\nспрашиваю сервер треков (HTTP+WS)…');
+
+        // канал HTTP (быстрый, только если хэш уже в кэше сервера)
         var url = 'http://' + HOST + '/api?hash=' + hash + '&index=0';
-        log('query → ' + url);
+        log('HTTP → ' + url);
         nativeReq(url, 'json', false,
             guard('srv-ok', function (json) {
                 var s = json && json.streams;
-                log('server streams = ' + (s ? s.length : 0));
+                log('HTTP streams = ' + (s ? s.length : 0));
                 if (s && s.length) showTracks(s);
-                else head('btih=' + hash.slice(0, 12) + '…\nсервер ответил, streams пуст');
             }),
             guard('srv-err', function (jq, ex) {
-                log('server ERR: ' + (ex || '') + ' status=' + (jq && jq.status));
-                head('btih=' + hash.slice(0, 12) + '…\nсервер треков НЕ ответил (' + (ex || (jq && jq.status)) + ')');
+                log('HTTP ERR: ' + (ex || '') + ' status=' + (jq && jq.status));
             }));
+
+        // канал WebSocket (запускает анализ на сервере) — основной
+        wsQuery(hash);
+    }
+
+    function wsQuery(hash) {
+        var wsurl = 'ws://' + HOST + '/?' + hash + '&index=0';
+        log('WS → ' + wsurl);
+        try {
+            var ws = new WebSocket(wsurl);
+            var t = setTimeout(function () { try { ws.close(); } catch (e) {} log('WS timeout'); }, 25000);
+            ws.onopen = function () { log('WS open'); };
+            ws.onmessage = guard('ws-msg', function (e) {
+                var raw = String(e.data || '');
+                log('WS msg[' + raw.length + ']: ' + raw.slice(0, 80));
+                var json; try { json = JSON.parse(raw); } catch (ex) { return; }
+                var s = json && json.streams;
+                if (s && s.length) { clearTimeout(t); try { ws.close(); } catch (e) {} showTracks(s); }
+            });
+            ws.onerror = function () { log('WS error (mixed-content? ' + location.protocol + ')'); };
+            ws.onclose = function (e) { clearTimeout(t); log('WS close code=' + (e && e.code)); };
+        } catch (e) {
+            log('WS throw: ' + e.message);
+            head('WebSocket недоступен: ' + e.message);
+        }
     }
 
     function showTracks(streams) {
