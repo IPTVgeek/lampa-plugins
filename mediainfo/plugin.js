@@ -1,15 +1,13 @@
 (function () {
     'use strict';
 
-    var VERSION = '1.5';
-    var HOST    = '185.204.0.61:8080';
-    var cache   = {};
+    var VERSION = '1.6';
 
-    /* ── persistent debug log ────────────────────────────────── */
+    /* ── log ─────────────────────────────────────────────────── */
 
     var logEl    = null;
     var logLines = [];
-    var MAX_LOG  = 10;
+    var MAX_LOG  = 12;
 
     function initLog() {
         if (logEl) return;
@@ -31,263 +29,35 @@
         } catch (e) {}
     }
 
-    /* ── диагностика сразу при загрузке ────────────────── */
-
     miLog('v' + VERSION + ' loaded');
-    miLog('proto=' + location.protocol +
-          ' fetch=' + typeof fetch +
-          ' ws=' + typeof WebSocket);
+    miLog('proto=' + location.protocol + ' fetch=' + typeof fetch + ' ws=' + typeof WebSocket);
     try { Lampa.Noty.show('MediaInfo v' + VERSION); } catch (e) {}
 
-    /* ── helpers ──────────────────────────────────────────────── */
+    /* ── monkey-patch: перехватываем ВСЕ события Lampa ────────── */
 
-    function esc(s) {
-        return String(s)
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;');
+    if (Lampa.Listener && typeof Lampa.Listener.send === 'function') {
+        var _origSend = Lampa.Listener.send.bind(Lampa.Listener);
+        Lampa.Listener.send = function (name, data) {
+            miLog('L:' + name);
+            return _origSend(name, data);
+        };
+        miLog('Listener patched');
+    } else {
+        miLog('Listener.send N/A');
     }
 
-    function fetchTimeout(url, ms) {
-        return new Promise(function (resolve, reject) {
-            var done  = false;
-            var ctrl  = typeof AbortController !== 'undefined' ? new AbortController() : null;
-            var timer = setTimeout(function () {
-                done = true;
-                if (ctrl) ctrl.abort();
-                reject(new Error('timeout'));
-            }, ms);
-            fetch(url, ctrl ? { signal: ctrl.signal } : {})
-                .then(function (r) { clearTimeout(timer); if (!done) resolve(r); })
-                .catch(function (e) { clearTimeout(timer); if (!done) reject(e); });
-        });
-    }
-
-    /* ── data fetching ───────────────────────────────────────── */
-
-    function getInfo(el, callback) {
-        var hash  = el.torrent_hash;
-        var index = el.id !== undefined ? el.id : 0;
-        var key   = hash + '_' + index;
-
-        miLog('getInfo h=' + (hash ? hash.slice(0,10) : 'NONE') + ' i=' + index);
-
-        if (cache.hasOwnProperty(key)) {
-            miLog('cache hit');
-            setTimeout(function () { callback(cache[key]); }, 0);
-            return;
-        }
-
-        if (el.ffprobe && Array.isArray(el.ffprobe) && el.ffprobe.length) {
-            miLog('ffprobe ok n=' + el.ffprobe.length);
-            var hit = { streams: el.ffprobe };
-            cache[key] = hit;
-            callback(hit);
-            return;
-        }
-
-        miLog('no ffprobe, server...');
-
-        var finished = false;
-
-        function done(result) {
-            if (finished) return;
-            finished = true;
-            cache[key] = result;
-            miLog('done streams=' + (result && result.streams ? result.streams.length : 0));
-            callback(result);
-        }
-
-        var globalTimer = setTimeout(function () {
-            miLog('global timeout');
-            done(null);
-        }, 10000);
-
-        function finish(result) {
-            clearTimeout(globalTimer);
-            done(result);
-        }
-
-        // HTTP
-        if (typeof fetch !== 'undefined') {
-            var httpUrl = 'http://' + HOST + '/api?hash=' + hash + '&index=' + index;
-            miLog('HTTP->');
-            fetchTimeout(httpUrl, 5000)
-                .then(function (r) { return r.json(); })
-                .then(function (json) {
-                    var n = json && json.streams ? json.streams.length : 0;
-                    miLog('HTTP ok n=' + n);
-                    if (n) finish(json);
-                })
-                .catch(function (e) { miLog('HTTP err:' + (e && e.message || '?')); });
+    try {
+        if (Lampa.Player && Lampa.Player.listener && typeof Lampa.Player.listener.send === 'function') {
+            var _origPSend = Lampa.Player.listener.send.bind(Lampa.Player.listener);
+            Lampa.Player.listener.send = function (name, data) {
+                miLog('P:' + name);
+                return _origPSend(name, data);
+            };
+            miLog('Player.listener patched');
         } else {
-            miLog('fetch N/A');
+            miLog('Player.listener N/A');
         }
-
-        // WebSocket
-        if (typeof WebSocket !== 'undefined') {
-            try {
-                var wsUrl = 'ws://' + HOST + '/?' + hash + '&index=' + index;
-                miLog('WS->');
-                var ws      = new WebSocket(wsUrl);
-                var wsTimer = setTimeout(function () {
-                    miLog('WS timeout');
-                    ws.close();
-                }, 8000);
-
-                ws.onopen    = function () { miLog('WS open'); };
-                ws.onmessage = function (e) {
-                    clearTimeout(wsTimer);
-                    ws.close();
-                    try {
-                        var json = JSON.parse(e.data);
-                        var n = json && json.streams ? json.streams.length : 0;
-                        miLog('WS msg n=' + n);
-                        if (n) finish(json);
-                    } catch (ex) { miLog('WS parse err'); }
-                };
-                ws.onerror = function () { miLog('WS error'); clearTimeout(wsTimer); };
-                ws.onclose = function () { clearTimeout(wsTimer); };
-            } catch (e) { miLog('WS exc:' + e.message); }
-        } else {
-            miLog('WebSocket N/A');
-        }
-    }
-
-    /* ── stream formatting ───────────────────────────────────── */
-
-    function buildLines(streams) {
-        var video = streams.filter(function (s) { return s.codec_type === 'video'; });
-        var audio = streams.filter(function (s) { return s.codec_type === 'audio'; });
-        var subs  = streams.filter(function (s) { return s.codec_type === 'subtitle'; });
-        var lines = [];
-
-        video.slice(0, 1).forEach(function (v) {
-            var p = [];
-            if (v.width && v.height)  p.push(v.width + '×' + v.height);
-            if (v.codec_name)         p.push(v.codec_name.toUpperCase());
-            var bps = v.bit_rate || (v.tags && (v.tags.BPS || v.tags['BPS-eng']));
-            if (bps && bps > 0)       p.push(Math.round(bps / 1e6) + ' Mb/s');
-            if (p.length) lines.push({ type: 'video', text: p.join(' · ') });
-        });
-
-        audio.forEach(function (a) {
-            var p = [];
-            if (a.tags && a.tags.language) p.push(a.tags.language.toUpperCase());
-            if (a.codec_name)              p.push(a.codec_name.toUpperCase());
-            if (a.channel_layout) {
-                var ch = a.channel_layout
-                    .replace('stereo', '2.0').replace('mono', '1.0')
-                    .replace('5.1(side)', '5.1').replace(/\s*\(side\)\s*/, '').trim();
-                if (ch) p.push(ch);
-            }
-            var bps = a.bit_rate || (a.tags && (a.tags.BPS || a.tags['BPS-eng']));
-            if (bps && bps > 0) p.push(Math.round(bps / 1000) + ' kb/s');
-            var lbl = a.tags && (a.tags.title || a.tags.handler_name);
-            if (lbl && lbl !== 'SoundHandler' && lbl !== 'AudioHandler') p.push(lbl);
-            lines.push({ type: 'audio', text: p.join(' · ') || '—' });
-        });
-
-        subs.forEach(function (s) {
-            var p = [];
-            if (s.tags && s.tags.language) p.push(s.tags.language.toUpperCase());
-            if (s.codec_name) {
-                p.push(s.codec_name.toUpperCase()
-                    .replace('SUBRIP', 'SRT').replace('HDMV_PGS_SUBTITLE', 'PGS')
-                    .replace('MOV_TEXT', 'MOV').replace('DVB_SUBTITLE', 'DVB'));
-            }
-            var lbl = s.tags && (s.tags.title || s.tags.handler_name);
-            if (lbl) p.push(lbl);
-            lines.push({ type: 'sub', text: p.join(' · ') || '—' });
-        });
-
-        return lines;
-    }
-
-    /* ── DOM rendering ───────────────────────────────────────── */
-
-    function renderInfo(item, streams) {
-        item.find('.mi-block').remove();
-        var lines = buildLines(streams);
-        if (!lines.length) return;
-        var html = '<div class="mi-block">';
-        lines.forEach(function (l) {
-            html += '<div class="mi-line mi-' + l.type + '">' + esc(l.text) + '</div>';
-        });
-        html += '</div>';
-        item.append(html);
-    }
-
-    /* ── Lampa integration ───────────────────────────────────── */
-
-    function showNoty(streams) {
-        try {
-            var audio = streams.filter(function (s) { return s.codec_type === 'audio'; });
-            var subs  = streams.filter(function (s) { return s.codec_type === 'subtitle'; });
-            var parts = [];
-            audio.forEach(function (a) {
-                var p = [];
-                if (a.tags && a.tags.language) p.push(a.tags.language.toUpperCase());
-                if (a.codec_name) p.push(a.codec_name.toUpperCase());
-                if (a.channel_layout) p.push(a.channel_layout
-                    .replace('stereo','2.0').replace('mono','1.0')
-                    .replace('5.1(side)','5.1').replace(/\s*\(side\)\s*/,'').trim());
-                if (p.length) parts.push('♪ ' + p.join(' '));
-            });
-            subs.forEach(function (s) {
-                var lang = s.tags && s.tags.language ? s.tags.language.toUpperCase() : '';
-                if (lang) parts.push('T ' + lang);
-            });
-            if (parts.length) {
-                miLog('Noty: ' + parts.join('|'));
-                Lampa.Noty.show(parts.join('  ·  '));
-            } else {
-                miLog('Noty: no tracks');
-            }
-        } catch (e) { miLog('Noty err:' + e.message); }
-    }
-
-    /* ── хук: Player start ───────────────────────────────────── */
-
-    Lampa.Player.listener.follow('start', function (data) {
-        var keys = data ? Object.keys(data).join(',') : 'null';
-        var hash = data && data.torrent_hash ? data.torrent_hash.slice(0, 10) : 'NONE';
-        miLog('Player.start keys=[' + keys + ']');
-        miLog('Player.start hash=' + hash);
-
-        if (!data || !data.torrent_hash) return;
-        var lookup = { torrent_hash: data.torrent_hash, id: data.id || 0 };
-        getInfo(lookup, function (result) {
-            if (result && result.streams && result.streams.length) showNoty(result.streams);
-        });
-    });
-
-    /* ── хук: torrent_file (ВСЕ типы) ────────────────────────── */
-
-    Lampa.Listener.follow('torrent_file', function (data) {
-        miLog('tf:' + data.type);
-
-        if (data.type !== 'render') return;
-
-        var el = data.element;
-        if (!el) { miLog('tf render: no element'); return; }
-
-        var hash  = el.torrent_hash || el.hash || el.info_hash;
-        var index = el.id !== undefined ? el.id : (el.file_index !== undefined ? el.file_index : 0);
-        miLog('tf render h=' + (hash ? hash.slice(0,10) : 'NONE') + ' i=' + index);
-        if (!hash) return;
-
-        var lookup = { torrent_hash: hash, id: index, ffprobe: el.ffprobe, path: el.path };
-        var item   = data.item;
-        item.append('<div class="mi-block mi-loading">···</div>');
-
-        getInfo(lookup, function (result) {
-            item.find('.mi-block').remove();
-            if (!result || !result.streams || !result.streams.length) return;
-            renderInfo(item, result.streams);
-            showNoty(result.streams);
-        });
-    });
+    } catch (e) { miLog('Player patch err:' + e.message); }
 
     /* ── styles ──────────────────────────────────────────────── */
 
@@ -295,15 +65,8 @@
     style.textContent =
         '#mi-log{position:fixed;bottom:0;left:0;right:0;z-index:99999;' +
             'background:rgba(0,0,0,.88);color:#0f0;' +
-            'font-family:monospace;font-size:12px;line-height:1.55;' +
-            'padding:5px 12px;pointer-events:none;}' +
-        '.mi-block{margin-top:.55em;display:flex;flex-direction:column;gap:.2em;font-size:.82em;line-height:1.4;opacity:.82}' +
-        '.mi-loading{opacity:.35;letter-spacing:.3em}' +
-        '.mi-line{display:flex;gap:.45em;align-items:baseline;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
-        '.mi-line::before{flex-shrink:0;opacity:.55;width:1.1em;text-align:center}' +
-        '.mi-video::before{content:"▶"}' +
-        '.mi-audio::before{content:"♪"}' +
-        '.mi-sub::before{content:"T"}';
+            'font-family:monospace;font-size:12px;line-height:1.5;' +
+            'padding:5px 12px;pointer-events:none;}';
     document.head.appendChild(style);
 
 })();
