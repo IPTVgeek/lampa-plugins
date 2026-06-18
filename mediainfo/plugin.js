@@ -1,8 +1,13 @@
 (function () {
     'use strict';
 
-    var HOST  = '185.204.0.61:8080';
-    var cache = {};
+    var VERSION = '1.2';
+    var HOST    = '185.204.0.61:8080';
+    var cache   = {};
+
+    // показываем версию при загрузке
+    try { Lampa.Noty.show('MediaInfo v' + VERSION); } catch (e) {}
+    console.log('[MediaInfo] v' + VERSION + ' loaded');
 
     /* ── helpers ──────────────────────────────────────────────── */
 
@@ -168,21 +173,51 @@
 
     /* ── Lampa integration ───────────────────────────────────── */
 
+    function showNoty(streams) {
+        try {
+            var audio = streams.filter(function (s) { return s.codec_type === 'audio'; });
+            var subs  = streams.filter(function (s) { return s.codec_type === 'subtitle'; });
+            var parts = [];
+            audio.forEach(function (a) {
+                var p = [];
+                if (a.tags && a.tags.language) p.push(a.tags.language.toUpperCase());
+                if (a.codec_name) p.push(a.codec_name.toUpperCase());
+                if (a.channel_layout) p.push(a.channel_layout.replace('stereo','2.0').replace('mono','1.0').replace('5.1(side)','5.1').replace(/\s*\(side\)\s*/,'').trim());
+                if (p.length) parts.push('♪ ' + p.join(' '));
+            });
+            subs.forEach(function (s) {
+                var lang = s.tags && s.tags.language ? s.tags.language.toUpperCase() : '';
+                if (lang) parts.push('T ' + lang);
+            });
+            if (parts.length) Lampa.Noty.show(parts.join('  ·  '));
+        } catch (e) {}
+    }
+
     Lampa.Listener.follow('torrent_file', function (data) {
         if (data.type !== 'render') return;
 
         var el = data.element;
-        if (!el || !el.torrent_hash) return;
+        if (!el) return;
 
-        var item = data.item;
+        // поддержка разных версий Lampa
+        var hash  = el.torrent_hash || el.hash || el.info_hash;
+        var index = el.id !== undefined ? el.id : (el.file_index !== undefined ? el.file_index : 0);
+        if (!hash) return;
+
+        var lookup = { torrent_hash: hash, id: index, ffprobe: el.ffprobe, path: el.path };
+        var item   = data.item;
 
         item.append('<div class="mi-block mi-loading">···</div>');
 
-        getInfo(el, function (result) {
+        getInfo(lookup, function (result) {
             item.find('.mi-block').remove();
-            if (result && result.streams && result.streams.length) {
-                renderInfo(item, result.streams);
-            }
+            if (!result || !result.streams || !result.streams.length) return;
+
+            // показываем в списке файлов
+            renderInfo(item, result.streams);
+
+            // показываем уведомление — видно всегда (TV, предзагрузка и т.д.)
+            showNoty(result.streams);
         });
     });
 
