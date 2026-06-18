@@ -1,8 +1,18 @@
 (function () {
     'use strict';
 
-    alert('PLUGIN LOADED');
+    console.log('[MediaInfo] Plugin loaded');
 
-    console.log('PLUGIN LOADED');
+    Lampa.Listener.follow('full', function (e) {
+        console.log('[FULL]', e);
+    });
+
+    Lampa.Listener.follow('activity', function (e) {
+        console.log('[ACTIVITY]', e);
+    });
+
+    Lampa.Listener.follow('torrent_file', function (e) {
+        console.log('[TORRENT_FILE]', e);
+    });
 
 })();
