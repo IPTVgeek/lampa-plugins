@@ -2,29 +2,27 @@
     'use strict';
 
     /* ───────────────────────────────────────────────────────────
-       MEDIAINFO DEBUG v0.10 — бейджи дорожек в списке (TV)
-       «Авто видимые + lazy»:
-         - element.ffprobe есть → рисуем сразу (бесплатно);
-         - первые AUTO_LIMIT строк резолвим автоматически очередью
-           (concurrency 2); остальные — по фокусу (прыгают в начало);
-         - резолв: add→локальный TorrServer→btih→drop → сервер треков.
-       Без патчей глобальных объектов.
+       MEDIAINFO DEBUG v0.11 — богатые бейджи из локального TorrServer
+       Источник: 127.0.0.1:8090
+         add(link)→btih → /torrents get (выбрать видеофайл) →
+         /ffp/{hash}/{index} → полный ffprobe.
+       Показываем больше UNCENSORED: HDR10/DV/HLG, Atmos, точные
+       кодеки и битрейты видео/аудио, формат субтитров.
+       Резерв: чужой 185.204.0.61 (если в сборке нет ffprobe).
+       Очередь: авто верхние 8 + lazy по фокусу. Без патчей globals.
        ─────────────────────────────────────────────────────────── */
 
-    var VERSION    = 'v0.10';
-    var HOST       = '185.204.0.61:8080';
+    var VERSION    = 'v0.11';
+    var HOST185    = '185.204.0.61:8080';
     var TS_BASES   = ['http://127.0.0.1:8090', 'http://localhost:8090', 'http://127.0.0.1:8080'];
     var TS_BASE    = null;
-    var AUTO_LIMIT = 8;     // сколько верхних строк тянуть автоматически
+    var AUTO_LIMIT = 8;
     var CONCURRENCY = 2;
+    var VIDEO_EXT  = /\.(mkv|mp4|avi|m4v|mov|ts|m2ts|mpg|mpeg|webm|wmv)$/i;
 
-    var cache   = {};       // link -> {state, streams}
-    var queue   = [];       // [{element,item,link}]
-    var running = 0;
-    var autoCount = 0;
+    var cache = {}, queue = [], running = 0, autoCount = 0;
 
     /* ── мини-лог ────────────────────────────────────────────── */
-
     var bot = document.createElement('div');
     bot.id = 'mi-log';
     bot.style.cssText = 'position:fixed;left:0;right:0;bottom:0;max-height:28%;z-index:2147483647;' +
@@ -42,10 +40,9 @@
     }
 
     /* ── сеть ────────────────────────────────────────────────── */
-
     function nativeReq(url, dataType, post, ok, err) {
         var n = new Lampa.Reguest();
-        n.timeout(12000);
+        n.timeout(15000);
         n.native(url, ok, err, post || false, { dataType: dataType || 'text' });
     }
     function extractHash(s) {
@@ -57,135 +54,193 @@
         return null;
     }
 
-    /* ── бейдж ───────────────────────────────────────────────── */
+    /* ── разбор ffprobe ──────────────────────────────────────── */
+    function bps(s) {
+        var v = s.bit_rate || (s.tags && (s.tags.BPS || s.tags['BPS-eng'] || s.tags['BPS-en']));
+        v = parseInt(v, 10);
+        return isNaN(v) ? 0 : v;
+    }
+    function resLabel(v) {
+        var h = v.height || 0;
+        if (h >= 2000) return '4K';
+        if (h >= 1000) return '1080p';
+        if (h >= 700)  return '720p';
+        if (h >= 500)  return '576p';
+        return v.width && v.height ? v.width + 'x' + v.height : '';
+    }
+    function hdrLabel(v) {
+        var ct = (v.color_transfer || '').toLowerCase();
+        var cp = (v.color_primaries || '').toLowerCase();
+        var dv = false;
+        try { dv = (v.side_data_list || []).some(function (sd) { return /dovi|dolby vision/i.test(JSON.stringify(sd)); }); } catch (e) {}
+        if (!dv && /dvhe|dvh1|dav1|dvav/i.test(v.codec_tag_string || '')) dv = true;
+        if (dv) return 'Dolby Vision';
+        if (ct === 'smpte2084') return 'HDR10';
+        if (ct === 'arib-std-b67') return 'HLG';
+        if (cp === 'bt2020') return 'HDR';
+        return '';
+    }
+    function isAtmos(a) { return /atmos|joc/i.test(a.profile || '') || /atmos/i.test((a.tags && a.tags.title) || ''); }
+    function chTxt(a) {
+        if (a.channel_layout) return a.channel_layout.replace('stereo', '2.0').replace('mono', '1.0').replace(/\(side\)|\(rear\)/g, '');
+        if (a.channels === 8) return '7.1'; if (a.channels === 6) return '5.1';
+        if (a.channels === 2) return '2.0'; if (a.channels === 1) return '1.0';
+        return a.channels ? a.channels + 'ch' : '';
+    }
 
-    function summarize(streams) {
-        var audio = streams.filter(function (s) { return s.codec_type === 'audio'; });
-        var subs  = streams.filter(function (s) { return s.codec_type === 'subtitle'; });
-        var parts = [];
-        audio.forEach(function (a) {
+    function build(streams) {
+        var out = [];
+        var v = streams.filter(function (s) { return s.codec_type === 'video' && s.codec_name !== 'mjpeg' && s.codec_name !== 'png'; })[0];
+        if (v) {
+            var p = [];
+            var r = resLabel(v); if (r) p.push(r);
+            if (v.codec_name) p.push(v.codec_name.toUpperCase().replace('H264', 'H.264'));
+            var hd = hdrLabel(v); if (hd) p.push(hd);
+            var vb = bps(v); if (vb) p.push(Math.round(vb / 1e6) + ' Мб/с');
+            out.push({ c: 'v', t: p.join(' · ') });
+        }
+        streams.filter(function (s) { return s.codec_type === 'audio'; }).forEach(function (a) {
             var p = [];
             if (a.tags && a.tags.language) p.push(a.tags.language.toUpperCase());
             if (a.codec_name) p.push(a.codec_name.toUpperCase());
-            if (a.channel_layout) p.push(a.channel_layout.replace('stereo', '2.0').replace('mono', '1.0').replace('(side)', ''));
-            parts.push('♪ ' + p.join(' '));
+            var ch = chTxt(a); if (ch) p.push(ch);
+            if (isAtmos(a)) p.push('Atmos');
+            var ab = bps(a); if (ab) p.push(Math.round(ab / 1000) + ' кб/с');
+            var nm = a.tags && (a.tags.title || a.tags.handler_name);
+            if (nm && !/SoundHandler|AudioHandler/i.test(nm)) p.push(nm.length > 18 ? nm.slice(0, 18) + '…' : nm);
+            out.push({ c: 'a', t: '♪ ' + p.join(' · ') });
         });
-        var sl = [];
-        subs.forEach(function (s) { if (s.tags && s.tags.language) sl.push(s.tags.language.toUpperCase()); });
-        sl = sl.filter(function (v, i) { return sl.indexOf(v) === i; });
-        if (sl.length) parts.push('T ' + sl.join('/'));
-        return parts;
+        var subs = streams.filter(function (s) { return s.codec_type === 'subtitle'; });
+        var sl = subs.map(function (s) {
+            var lang = (s.tags && s.tags.language ? s.tags.language.toUpperCase() : '');
+            var fmt = (s.codec_name || '').toUpperCase().replace('SUBRIP', 'SRT').replace('HDMV_PGS_SUBTITLE', 'PGS').replace('MOV_TEXT', 'TX');
+            return (lang + (fmt ? ' ' + fmt : '')).trim();
+        }).filter(function (v, i, a) { return v && a.indexOf(v) === i; });
+        if (sl.length) out.push({ c: 's', t: 'T ' + sl.join(' / ') });
+        return out;
     }
+
     function renderBadge(item, streams) {
         try {
             item.find('.mi-badge').remove();
-            var parts = summarize(streams);
-            if (!parts.length) return;
-            item.append('<div class="mi-badge">' + parts.map(function (p) {
-                return '<span>' + p.replace(/</g, '&lt;') + '</span>';
+            var rows = build(streams);
+            if (!rows.length) return;
+            item.append('<div class="mi-badge">' + rows.map(function (r) {
+                return '<span class="mi-' + r.c + '">' + r.t.replace(/</g, '&lt;') + '</span>';
             }).join('') + '</div>');
-        } catch (e) {}
+        } catch (e) { log('badge err ' + e.message); }
     }
-    function loading(item, on) {
-        try { item.find('.mi-badge').remove(); if (on) item.append('<div class="mi-badge mi-load">···</div>'); } catch (e) {}
+    function loading(item, on) { try { item.find('.mi-badge').remove(); if (on) item.append('<div class="mi-badge mi-load">···</div>'); } catch (e) {} }
+
+    /* ── локальный TorrServer: add → get → ffp → drop ────────── */
+    function tsAdd(link, cb) {
+        nativeReq(TS_BASE + '/torrents', 'json',
+            JSON.stringify({ action: 'add', link: link, title: '[mi-probe]', save_to_db: false }),
+            guard('add', function (j) { cb((j && (j.hash || (j.torrent && j.torrent.hash))) || null); }),
+            function () { cb(null); });
+    }
+    function tsDrop(hash) {
+        if (!hash) return;
+        nativeReq(TS_BASE + '/torrents', 'text', JSON.stringify({ action: 'drop', hash: hash }), function () {}, function () {});
+    }
+    function pickIndex(fs) {
+        if (!fs || !fs.length) return 0;
+        var arr = fs.slice().sort(function (a, b) { return (b.length || 0) - (a.length || 0); });
+        var vid = arr.filter(function (f) { return VIDEO_EXT.test(f.path || ''); });
+        var pick = (vid[0] || arr[0]);
+        return pick.id != null ? pick.id : 0;
+    }
+    function ffp(hash, idx, attempt, cb) {
+        nativeReq(TS_BASE + '/ffp/' + hash + '/' + idx, 'json', false,
+            guard('ffp', function (j) {
+                var s = j && j.streams;
+                if (s && s.length) { log('ffp ok idx=' + idx); cb(s); }
+                else cb(null);
+            }),
+            function (jq, ex) {
+                if (attempt < 3) return setTimeout(function () { ffp(hash, idx, attempt + 1, cb); }, 2500);
+                log('ffp ERR ' + (ex || (jq && jq.status)));
+                cb(null, 'ffp-fail');
+            });
+    }
+    function probeLocal(hash, cb) {
+        nativeReq(TS_BASE + '/torrents', 'json', JSON.stringify({ action: 'get', hash: hash }),
+            guard('get', function (j) {
+                var idx = pickIndex(j && j.file_stats);
+                ffp(hash, idx, 0, cb);
+            }),
+            function () { ffp(hash, 0, 0, cb); });
     }
 
-    /* ── сервер треков ───────────────────────────────────────── */
-
-    function queryTracks(hash, cb) {
+    /* ── резерв: 185 ─────────────────────────────────────────── */
+    function probe185(hash, cb) {
         var got = false;
         function done(s) { if (got) return; got = true; cb(s); }
-        nativeReq('http://' + HOST + '/api?hash=' + hash + '&index=0', 'json', false,
-            guard('http', function (json) { if (json && json.streams && json.streams.length) done(json.streams); }),
-            function () {});
+        nativeReq('http://' + HOST185 + '/api?hash=' + hash + '&index=0', 'json', false,
+            guard('185http', function (j) { if (j && j.streams && j.streams.length) done(j.streams); }), function () {});
         try {
-            var ws = new WebSocket('ws://' + HOST + '/?' + hash + '&index=0');
-            var t = setTimeout(function () { try { ws.close(); } catch (e) {} done(null); }, 25000);
-            ws.onmessage = guard('ws', function (e) {
-                var j; try { j = JSON.parse(String(e.data || '')); } catch (ex) { return; }
+            var ws = new WebSocket('ws://' + HOST185 + '/?' + hash + '&index=0');
+            var t = setTimeout(function () { try { ws.close(); } catch (e) {} done(null); }, 22000);
+            ws.onmessage = guard('185ws', function (e) {
+                var j; try { j = JSON.parse(String(e.data || '')); } catch (x) { return; }
                 if (j && j.streams && j.streams.length) { clearTimeout(t); try { ws.close(); } catch (e) {} done(j.streams); }
             });
             ws.onerror = function () {};
         } catch (e) {}
     }
 
-    /* ── TorrServer add/drop ─────────────────────────────────── */
-
-    function tsAdd(link, cb) {
-        if (!TS_BASE) { cb(null); return; }
-        nativeReq(TS_BASE + '/torrents', 'json',
-            JSON.stringify({ action: 'add', link: link, title: '[mi-probe]', save_to_db: false }),
-            guard('add', function (json) { cb((json && (json.hash || (json.torrent && json.torrent.hash))) || null); }),
-            function () { cb(null); });
-    }
-    function tsDrop(hash) {
-        if (!TS_BASE || !hash) return;
-        nativeReq(TS_BASE + '/torrents', 'text', JSON.stringify({ action: 'drop', hash: hash }), function () {}, function () {});
-    }
-
     /* ── очередь ─────────────────────────────────────────────── */
-
     function enqueue(element, item, priority) {
         var link = element.Link || element.link || element.MagnetUri || element.url;
-        if (!link) return;
+        if (!link || !TS_BASE) return;
         if (cache[link]) { if (cache[link].state === 'done') renderBadge(item, cache[link].streams); return; }
-
-        // уже в очереди? поднять в начало при priority
         for (var i = 0; i < queue.length; i++) {
-            if (queue[i].link === link) {
-                if (priority) { var j = queue.splice(i, 1)[0]; queue.unshift(j); }
-                return;
-            }
+            if (queue[i].link === link) { if (priority) queue.unshift(queue.splice(i, 1)[0]); return; }
         }
         var job = { element: element, item: item, link: link };
         if (priority) queue.unshift(job); else queue.push(job);
         pump();
     }
-
     function pump() {
         while (running < CONCURRENCY && queue.length) {
             var job = queue.shift();
             if (cache[job.link] && cache[job.link].state === 'done') { renderBadge(job.item, cache[job.link].streams); continue; }
-            running++;
-            resolveJob(job, function () { running--; pump(); });
+            running++; resolveJob(job, function () { running--; pump(); });
         }
     }
-
     function resolveJob(job, onDone) {
         cache[job.link] = { state: 'pending' };
         loading(job.item, true);
         var direct = extractHash(job.element.MagnetUri) || extractHash(job.element.Link);
 
-        function withHash(hash) {
-            if (!hash) { loading(job.item, false); cache[job.link] = null; onDone(); return; }
-            queryTracks(hash, function (streams) {
-                tsDrop(hash);
-                loading(job.item, false);
-                if (streams && streams.length) {
-                    cache[job.link] = { state: 'done', streams: streams };
-                    renderBadge(job.item, streams);
-                    log('✓ ' + summarize(streams).join(' '));
-                } else { cache[job.link] = null; log('нет дорожек: ' + (job.element.Title || '').slice(0, 24)); }
-                onDone();
+        function finish(streams, src) {
+            loading(job.item, false);
+            if (streams && streams.length) {
+                cache[job.link] = { state: 'done', streams: streams };
+                renderBadge(job.item, streams);
+                log('✓[' + src + '] ' + (build(streams)[0] || {}).t);
+            } else { cache[job.link] = null; log('пусто: ' + (job.element.Title || '').slice(0, 22)); }
+            onDone();
+        }
+
+        function go(hash) {
+            if (!hash) { finish(null); return; }
+            probeLocal(hash, function (streams) {
+                if (streams && streams.length) { tsDrop(hash); finish(streams, 'ffp'); }
+                else { log('локальный ffp пуст → 185'); probe185(hash, function (s2) { tsDrop(hash); finish(s2, '185'); }); }
             });
         }
-        if (direct) withHash(direct); else tsAdd(job.link, withHash);
+        if (direct) go(direct); else tsAdd(job.link, go);
     }
 
-    /* ── render ──────────────────────────────────────────────── */
-
+    /* ── render hook ─────────────────────────────────────────── */
     function onRender(element, item) {
         if (element.ffprobe && element.ffprobe.length) { renderBadge(item, element.ffprobe); return; }
-
         if (autoCount < AUTO_LIMIT) { autoCount++; enqueue(element, item, false); }
-
-        try {
-            item.on('hover:focus', guard('focus', function () { enqueue(element, item, true); }));
-        } catch (e) {}
+        try { item.on('hover:focus', guard('focus', function () { enqueue(element, item, true); })); } catch (e) {}
     }
 
     /* ── init ────────────────────────────────────────────────── */
-
     function detectTS() {
         TS_BASES.forEach(function (base) {
             nativeReq(base + '/echo', 'text', false,
@@ -193,34 +248,27 @@
                 function () {});
         });
     }
-
     guard('init', function () {
         document.body.appendChild(bot);
         log(VERSION + ' loaded');
-        var style = document.createElement('style');
-        style.textContent =
-            '.mi-badge{display:flex;flex-wrap:wrap;gap:.4em;margin-top:.4em;font-size:.78em;opacity:.92}' +
-            '.mi-badge span{background:rgba(124,252,0,.15);border:1px solid rgba(124,252,0,.5);' +
-            'border-radius:.3em;padding:.05em .4em;white-space:nowrap}' +
-            '.mi-load{opacity:.4;letter-spacing:.3em}';
-        document.head.appendChild(style);
-
+        var st = document.createElement('style');
+        st.textContent =
+            '.mi-badge{display:flex;flex-wrap:wrap;gap:.4em;margin-top:.4em;font-size:.78em;opacity:.95}' +
+            '.mi-badge span{border-radius:.3em;padding:.05em .45em;white-space:nowrap;border:1px solid}' +
+            '.mi-v{background:rgba(80,160,255,.15);border-color:rgba(80,160,255,.55)}' +
+            '.mi-a{background:rgba(124,252,0,.13);border-color:rgba(124,252,0,.5)}' +
+            '.mi-s{background:rgba(255,200,0,.13);border-color:rgba(255,200,0,.5)}' +
+            '.mi-load{opacity:.4;letter-spacing:.3em;border:0!important;background:none!important}';
+        document.head.appendChild(st);
         detectTS();
-
         if (!(window.Lampa && Lampa.Listener)) { log('Lampa.Listener нет'); return; }
-
         Lampa.Listener.follow('torrent', guard('ev', function (data) {
             if (data.type === 'render' && data.element && data.item) onRender(data.element, data.item);
-            // новый список — сбрасываем авто-лимит
             if (data.type === 'list_open' || data.type === 'open') autoCount = 0;
         }));
-
-        log('готов, AUTO_LIMIT=' + AUTO_LIMIT + ' conc=' + CONCURRENCY);
+        log('готов; auto=' + AUTO_LIMIT + ' conc=' + CONCURRENCY);
     })();
 
-    window.MIDBG = {
-        log: log,
-        clearCache: function () { cache = {}; queue = []; log('cache/queue cleared'); }
-    };
+    window.MIDBG = { log: log, clearCache: function () { cache = {}; queue = []; log('cleared'); } };
 
 })();
