@@ -1,6 +1,6 @@
 (function () {
     'use strict';
-    var VERSION = '1.12';
+    var VERSION = '1.13';
 
     var logEl=null, logLines=[], MAX_LOG=16;
     function initLog(){if(logEl)return;logEl=document.createElement('div');logEl.id='mi-log';document.body.appendChild(logEl);}
@@ -22,22 +22,35 @@
         if (data.type !== 'onenter') return;
         var el = data.element;
         if (!el) return;
-        miLog('=== onenter ===');
 
-        var link = el.Link || el.link || el.url || el.magnet || '';
-        miLog('Link(1)=' + link.slice(0, 60));
-        if (link.length > 60)  miLog('Link(2)=' + link.slice(60, 120));
-        if (link.length > 120) miLog('Link(3)=' + link.slice(120, 180));
+        var link = el.Link || el.link || el.url || '';
+        if (!link) { miLog('no Link'); return; }
 
-        try {
-            var ts = Lampa.Storage.get('torrserver_url') || Lampa.Storage.get('torrserver') || '';
-            miLog('TorrServer=' + String(ts).slice(0, 60));
-        } catch(e) { miLog('TorrServer N/A'); }
+        miLog('fetching Link...');
+        miLog(link.slice(0, 70));
 
-        try {
-            var server = (Lampa.Torrent && Lampa.Torrent.server) ? Lampa.Torrent.server() : 'N/A';
-            miLog('Torrent.server=' + String(server).slice(0, 60));
-        } catch(e) { miLog('Torrent.server N/A'); }
+        fetch(link)
+            .then(function(r) {
+                miLog('fetch status=' + r.status);
+                return r.text();
+            })
+            .then(function(text) {
+                miLog('response len=' + text.length);
+                miLog('resp(1)=' + text.slice(0, 70));
+                if (text.length > 70) miLog('resp(2)=' + text.slice(70, 140));
+
+                var m = text.match(/urn:btih:([a-fA-F0-9]{40})/i);
+                if (m) {
+                    miLog('HASH=' + m[1]);
+                } else {
+                    var m2 = text.match(/urn:btih:([A-Z2-7]{32})/i);
+                    if (m2) miLog('HASH(b32)=' + m2[1]);
+                    else miLog('no hash found in response');
+                }
+            })
+            .catch(function(e) {
+                miLog('fetch err=' + (e.message || e));
+            });
     });
 
     var style=document.createElement('style');
