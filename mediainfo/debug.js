@@ -2,7 +2,7 @@
     'use strict';
 
     /* ───────────────────────────────────────────────────────────
-       MEDIAINFO DEBUG v0.5 — добываем btih на Android TV
+       MEDIAINFO DEBUG v0.6 — добываем btih на Android TV
        nnmclub: MagnetUri нет, только parsemagnet (302).
        Канал 1 (резолв 302) мёртв — натив не отдаёт Location.
        Канал 2 (рабочий): локальный TorrServer 127.0.0.1:8090
@@ -10,7 +10,7 @@
        Без патчей глобальных объектов.
        ─────────────────────────────────────────────────────────── */
 
-    var VERSION = 'v0.5';
+    var VERSION = 'v0.6';
     var HOST    = '185.204.0.61:8080';
     var TS_BASES = ['http://127.0.0.1:8090', 'http://localhost:8090', 'http://127.0.0.1:8080', 'http://127.0.0.1:9090'];
 
@@ -158,11 +158,18 @@
     }
 
     function listTS(base, movieTitle, attempt) {
+        log('TS list try#' + attempt + ' @' + base);
+        head('TorrServer (' + base.replace('http://', '') + ')\nчитаю список, попытка ' + (attempt + 1) + '…');
         nativeReq(base + '/torrents', 'json', JSON.stringify({ action: 'list' }),
             guard('ts-list', function (arr) {
+                log('TS resp type=' + (Array.isArray(arr) ? 'array[' + arr.length + ']' : typeof arr));
+                if (arr && !Array.isArray(arr)) {
+                    if (Array.isArray(arr.torrents)) arr = arr.torrents;
+                    else log('TS resp raw: ' + JSON.stringify(arr).slice(0, 140));
+                }
                 if (!arr || !arr.length) {
-                    if (attempt < 5) return setTimeout(function () { listTS(base, movieTitle, attempt + 1); }, 1500);
-                    head('TorrServer пустой список');
+                    if (attempt < 6) return setTimeout(function () { listTS(base, movieTitle, attempt + 1); }, 1500);
+                    head('TorrServer вернул пустой список');
                     return log('TS list пуст (' + base + ')');
                 }
                 log('TS list n=' + arr.length + ' @' + base);
@@ -185,8 +192,10 @@
                 }
             }),
             function (jq, ex) {
-                if (attempt < 3) setTimeout(function () { listTS(base, movieTitle, attempt + 1); }, 1500);
-                else { head('TorrServer /torrents ошибка: ' + (ex || (jq && jq.status))); log('TS list ERR ' + base + ' ' + (ex || (jq && jq.status))); }
+                var info = (ex || '') + ' status=' + (jq && jq.status);
+                log('TS list ERR#' + attempt + ' ' + base + ' ' + info);
+                if (attempt < 4) setTimeout(function () { listTS(base, movieTitle, attempt + 1); }, 1500);
+                else head('TorrServer /torrents ошибка:\n' + info);
             });
     }
 
