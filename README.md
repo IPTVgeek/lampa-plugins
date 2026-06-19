@@ -10,17 +10,19 @@
 
 **Папка:** [`mediainfo/`](mediainfo/)
 
-**Установка** (Настройки → Расширения → Добавить):
-
-```
-https://raw.githubusercontent.com/IPTVgeek/lampa-plugins/main/mediainfo/plugin.js
-```
-
-Или через jsDelivr (для тестов лучше фиксировать конкретный коммит вместо `@main` — он кэшируется на сутки):
+**Установка.** В Lampa: Настройки → Расширения → Добавить плагин, вставьте ссылку через **jsDelivr**:
 
 ```
 https://cdn.jsdelivr.net/gh/IPTVgeek/lampa-plugins@main/mediainfo/plugin.js
 ```
+
+jsDelivr кэширует `@main` примерно на сутки. Чтобы поставить точную версию или сразу получить свежий код (актуально при тестах), укажите конкретный коммит вместо `@main`:
+
+```
+https://cdn.jsdelivr.net/gh/IPTVgeek/lampa-plugins@14290ed/mediainfo/plugin.js
+```
+
+> Примечание: ставьте именно через jsDelivr — прямые raw-ссылки GitHub в Lampa часто не подхватываются.
 
 **Возможности:**
 
@@ -43,4 +45,4 @@ mediainfo/
 
 ## Для тех, кто хочет дорабатывать
 
-Настройки вынесены в начало `mediainfo/plugin.js`: `AUTO_LIMIT`, `CONCURRENCY`, `HOST185` (адрес резервного анализатора), `DEBUG` (лог в консоль). PR и issue приветствуются.
+Настройки вынесены в начало `mediainfo/plugin.js`: `AUTO_LIMIT`, `CONCURRENCY`, `HOST185` (адрес резервного анализатора), `DEBUG` (лог в консоль). Для тестов на приставке удобна версия `debug.js` (с экранным логом) и jsDelivr с конкретным коммитом (чтобы обойти суточный кэш `@main`). PR и issue приветствуются.
