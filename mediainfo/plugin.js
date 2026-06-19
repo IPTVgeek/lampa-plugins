@@ -9,9 +9,10 @@
        Слой 2 — обогащение по ffprobe (аудио/субтитры/битрейты).
        Источник ffprobe: локальный TorrServer /ffp → резерв 185.
        v1.1: защита от мусорных/троллинг-ответов сервера.
+       v1.2: сброс отравленного кэша + жёсткий лимит отрисовки.
        ═══════════════════════════════════════════════════════════ */
 
-    var VERSION     = '1.1';
+    var VERSION     = '1.2';
     var DEBUG       = false;
     var HOST185     = '185.204.0.61:8080';
     var TS_BASES    = [];
@@ -20,8 +21,9 @@
     var CONCURRENCY = 3;
     var MAX_AUDIO   = 8;     // сколько аудио-чипов показывать (дальше «+N»)
     var MAX_SUBS    = 10;
+    var MAX_RENDER  = 16;    // жёсткий потолок чипов на строку (защита от зависания)
     var VIDEO_EXT   = /\.(mkv|mp4|avi|m4v|mov|ts|m2ts|mpg|mpeg|webm|wmv)$/i;
-    var CACHE_KEY   = 'mediainfo_cache_v1';
+    var CACHE_KEY   = 'mediainfo_cache_v2';   // v2 — старый отравленный кэш игнорируется
 
     var ffpAvailable = true;
     var cache = {}, queue = [], running = 0, autoCount = 0;
@@ -33,7 +35,14 @@
 
     /* ── постоянный кэш ──────────────────────────────────────── */
     function loadCache() {
-        try { var o = Lampa.Storage.get(CACHE_KEY, {}); if (o && typeof o === 'object') for (var k in o) cache[k] = { state: 'done', rows: o[k] }; } catch (e) {}
+        try { Lampa.Storage.set('mediainfo_cache_v1', {}); } catch (e) {}   // выкидываем старый отравленный кэш
+        try {
+            var o = Lampa.Storage.get(CACHE_KEY, {});
+            if (o && typeof o === 'object') for (var k in o) {
+                var rows = o[k];
+                if (Array.isArray(rows) && rows.length && rows.length <= MAX_RENDER) cache[k] = { state: 'done', rows: rows };
+            }
+        } catch (e) {}
     }
     var saveTimer = null;
     function saveCache() {
@@ -181,8 +190,10 @@
     function renderRows(item, rows, pending) {
         try {
             item.find('.mi-badge').remove();
-            if ((!rows || !rows.length) && !pending) return;
-            var html = (rows || []).map(function (r) { return '<span class="mi-' + r.c + '">' + r.t.replace(/</g, '&lt;') + '</span>'; }).join('');
+            rows = rows || [];
+            if (rows.length > MAX_RENDER) rows = rows.slice(0, MAX_RENDER);   // защита от зависания
+            if (!rows.length && !pending) return;
+            var html = rows.map(function (r) { return '<span class="mi-' + r.c + '">' + r.t.replace(/</g, '&lt;') + '</span>'; }).join('');
             if (pending) html += '<span class="mi-load">···</span>';
             item.append('<div class="mi-badge">' + html + '</div>');
         } catch (e) {}
