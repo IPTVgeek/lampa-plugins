@@ -5,28 +5,21 @@
        MEDIAINFO для Lampa — дорожки и субтитры раздачи в списке
        Автор: Гик IPTV · https://github.com/IPTVgeek/lampa-plugins
 
-       Как это работает (коротко):
-       • Слой 1 — мгновенно из НАЗВАНИЯ раздачи (как фильтр Lampa):
-         4K/1080p/720p, HDR10/HDR10+/Dolby Vision, кодек.
-       • Слой 2 — обогащение по ffprobe: точные аудиодорожки
-         (язык·кодек·каналы·битрейт·Atmos), субтитры с форматом,
-         битрейт видео. Дорисовывается поверх.
-       Источник ffprobe:
-         — браузер/внутр. плеер: событие torrent_file → el.ffprobe
-           (мгновенно) либо по реальному el.torrent_hash;
-         — Android TV (внешний плеер): событие torrent → добавляем
-           magnet в локальный TorrServer, берём btih, делаем /ffp,
-           резерв — публичный анализатор 185.204.0.61 (Tracks
-           Inspector). Никаких патчей глобальных объектов.
+       Слой 1 — мгновенно из названия (4K/1080p, HDR/DV, кодек).
+       Слой 2 — обогащение по ffprobe (аудио/субтитры/битрейты).
+       Источник ffprobe: локальный TorrServer /ffp → резерв 185.
+       v1.1: защита от мусорных/троллинг-ответов сервера.
        ═══════════════════════════════════════════════════════════ */
 
-    var VERSION     = '1.0';
-    var DEBUG       = false;                 // true → лог в консоль
-    var HOST185     = '185.204.0.61:8080';   // публичный резерв (Tracks Inspector)
+    var VERSION     = '1.1';
+    var DEBUG       = false;
+    var HOST185     = '185.204.0.61:8080';
     var TS_BASES    = [];
     var TS_BASE     = null;
-    var AUTO_LIMIT  = 8;                      // сколько верхних строк тянуть автоматически
+    var AUTO_LIMIT  = 8;
     var CONCURRENCY = 3;
+    var MAX_AUDIO   = 8;     // сколько аудио-чипов показывать (дальше «+N»)
+    var MAX_SUBS    = 10;
     var VIDEO_EXT   = /\.(mkv|mp4|avi|m4v|mov|ts|m2ts|mpg|mpeg|webm|wmv)$/i;
     var CACHE_KEY   = 'mediainfo_cache_v1';
 
@@ -50,7 +43,7 @@
         }, 1000);
     }
 
-    /* ── сеть (нативный httpReq на Android, ajax в браузере) ─── */
+    /* ── сеть ────────────────────────────────────────────────── */
     function nativeReq(url, dataType, post, ok, err) {
         var n = new Lampa.Reguest();
         n.timeout(15000);
@@ -94,8 +87,10 @@
         return c ? [c] : [];
     }
 
-    /* ── СЛОЙ 2: разбор ffprobe ──────────────────────────────── */
+    /* ── СЛОЙ 2: разбор ffprobe (с санитайзом) ───────────────── */
     function bps(s) { var v = s.bit_rate || (s.tags && (s.tags.BPS || s.tags['BPS-eng'] || s.tags['BPS-en'])); v = parseInt(v, 10); return isNaN(v) ? 0 : v; }
+    function cleanLang(l) { l = String(l || ''); return /^[A-Za-z]{2,4}$/.test(l) ? l.toUpperCase() : ''; }
+    function cleanCodec(c) { c = String(c || ''); return /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,11}$/.test(c) ? c.toUpperCase().replace('H264', 'H.264') : ''; }
     function resLabel(v) {
         var w = v.width || v.coded_width || 0, h = v.height || v.coded_height || 0;
         if (w >= 3000 || h >= 1900) return '4K';
@@ -116,10 +111,10 @@
     }
     function isAtmos(a) { return /atmos|joc/i.test(a.profile || '') || /atmos/i.test((a.tags && a.tags.title) || ''); }
     function chTxt(a) {
-        if (a.channel_layout) return a.channel_layout.replace('stereo', '2.0').replace('mono', '1.0').replace(/\(side\)|\(rear\)/g, '');
+        if (a.channel_layout && /^[0-9a-z.()+ -]{1,12}$/i.test(a.channel_layout)) return a.channel_layout.replace('stereo', '2.0').replace('mono', '1.0').replace(/\(side\)|\(rear\)/g, '');
         if (a.channels === 8) return '7.1'; if (a.channels === 6) return '5.1';
         if (a.channels === 2) return '2.0'; if (a.channels === 1) return '1.0';
-        return a.channels ? a.channels + 'ch' : '';
+        return (a.channels > 0 && a.channels <= 16) ? a.channels + 'ch' : '';
     }
     function videoOf(streams) { return streams.filter(function (s) { return s.codec_type === 'video' && s.codec_name !== 'mjpeg' && s.codec_name !== 'png'; })[0]; }
 
@@ -129,28 +124,32 @@
         if (v) {
             var p = [];
             var r = resLabel(v); if (r) p.push(r);
-            if (v.codec_name) p.push(v.codec_name.toUpperCase().replace('H264', 'H.264'));
+            var cc = cleanCodec(v.codec_name); if (cc) p.push(cc);
             var hd = hdrLabel(v); if (hd) p.push(hd);
-            var vb = bps(v); if (vb) p.push(Math.round(vb / 1e6) + ' Мб/с');
-            out.push({ c: 'v', t: p.join(' · ') });
+            var vb = bps(v); if (vb > 0 && vb <= 200e6) p.push(Math.round(vb / 1e6) + ' Мб/с');
+            if (p.length) out.push({ c: 'v', t: p.join(' · ') });
         }
+        var arows = [];
         streams.filter(function (s) { return s.codec_type === 'audio'; }).forEach(function (a) {
             var p = [];
-            if (a.tags && a.tags.language) p.push(a.tags.language.toUpperCase());
-            if (a.codec_name) p.push(a.codec_name.toUpperCase());
+            var lg = cleanLang(a.tags && a.tags.language); if (lg) p.push(lg);
+            var cc = cleanCodec(a.codec_name); if (cc) p.push(cc);
             var ch = chTxt(a); if (ch) p.push(ch);
             if (isAtmos(a)) p.push('Atmos');
-            var ab = bps(a); if (ab) p.push(Math.round(ab / 1000) + ' кб/с');
+            var ab = bps(a); if (ab > 0 && ab <= 12e6) p.push(Math.round(ab / 1000) + ' кб/с');
             var nm = a.tags && (a.tags.title || a.tags.handler_name);
-            if (nm && !/SoundHandler|AudioHandler/i.test(nm)) p.push(nm.length > 18 ? nm.slice(0, 18) + '…' : nm);
-            out.push({ c: 'a', t: '♪ ' + p.join(' · ') });
+            if (nm && !/SoundHandler|AudioHandler/i.test(nm)) { nm = String(nm).replace(/[<>]/g, ''); if (nm.length > 18) nm = nm.slice(0, 18) + '…'; p.push(nm); }
+            if (p.length) arows.push({ c: 'a', t: '♪ ' + p.join(' · ') });
         });
-        var subs = streams.filter(function (s) { return s.codec_type === 'subtitle'; });
-        var sl = subs.map(function (s) {
-            var lang = (s.tags && s.tags.language ? s.tags.language.toUpperCase() : '');
-            var fmt = (s.codec_name || '').toUpperCase().replace('SUBRIP', 'SRT').replace('HDMV_PGS_SUBTITLE', 'PGS').replace('MOV_TEXT', 'TX');
+        arows.slice(0, MAX_AUDIO).forEach(function (r) { out.push(r); });
+        if (arows.length > MAX_AUDIO) out.push({ c: 'a', t: '♪ +' + (arows.length - MAX_AUDIO) });
+
+        var sl = streams.filter(function (s) { return s.codec_type === 'subtitle'; }).map(function (s) {
+            var lang = cleanLang(s.tags && s.tags.language);
+            var raw = (s.codec_name || '').toUpperCase().replace('SUBRIP', 'SRT').replace('HDMV_PGS_SUBTITLE', 'PGS').replace('MOV_TEXT', 'TX');
+            var fmt = /^[A-Z0-9]{1,8}$/.test(raw) ? raw : '';
             return (lang + (fmt ? ' ' + fmt : '')).trim();
-        }).filter(function (v, i, a) { return v && a.indexOf(v) === i; });
+        }).filter(function (v, i, a) { return v && a.indexOf(v) === i; }).slice(0, MAX_SUBS);
         if (sl.length) out.push({ c: 's', t: 'T ' + sl.join(' / ') });
         return out;
     }
@@ -164,6 +163,19 @@
             if (pt.hdr && !/HDR|Dolby|HLG/i.test(v.t)) v.t += ' · ' + pt.hdr;
         }
         return rows;
+    }
+
+    /* отсев явного мусора (троллинг-ответ сервера) */
+    function safeRows(streams, pt) {
+        if (!streams || !streams.length) return null;
+        var a = 0, s = 0;
+        for (var i = 0; i < streams.length; i++) {
+            if (streams[i].codec_type === 'audio') a++;
+            else if (streams[i].codec_type === 'subtitle') s++;
+        }
+        if (a > 12 || s > 24 || streams.length > 48) return null;
+        var rows = mergeRows(streams, pt);
+        return rows.length ? rows : null;
     }
 
     function renderRows(item, rows, pending) {
@@ -253,11 +265,9 @@
         var direct = extractHash(job.element.MagnetUri) || extractHash(job.element.Link);
 
         function finish(streams) {
-            var rows;
-            if (streams && streams.length) {
-                rows = mergeRows(streams, pt);
-                cache[job.link] = { state: 'done', rows: rows }; saveCache();
-            } else { rows = trows; cache[job.link] = null; }
+            var rows = safeRows(streams, pt);
+            if (rows) { cache[job.link] = { state: 'done', rows: rows }; saveCache(); }
+            else { rows = trows; cache[job.link] = null; }
             renderRows(job.item, rows, false);
             onDone();
         }
@@ -274,7 +284,10 @@
 
     /* ── событие torrent (Android TV: список раздач) ─────────── */
     function onTorrentRender(element, item) {
-        if (element.ffprobe && element.ffprobe.length) { renderRows(item, mergeRows(element.ffprobe, parseTitle(element.Title || element.title))); return; }
+        if (element.ffprobe && element.ffprobe.length) {
+            renderRows(item, safeRows(element.ffprobe, parseTitle(element.Title || element.title)) || titleRows(element));
+            return;
+        }
         var link = element.Link || element.link || element.MagnetUri || element.url;
         if (link && cache[link] && cache[link].state === 'done') { renderRows(item, cache[link].rows); return; }
 
@@ -295,7 +308,7 @@
     function onFileRender(element, item) {
         var pt = parseTitle(element.title || element.Title || '');
         if (element.ffprobe && Array.isArray(element.ffprobe) && element.ffprobe.length) {
-            renderRows(item, mergeRows(element.ffprobe, pt)); return;
+            renderRows(item, safeRows(element.ffprobe, pt) || titleRows(element)); return;
         }
         var hash = element.torrent_hash || element.info_hash || extractHash(element.hash);
         if (!hash) return;
@@ -305,11 +318,9 @@
 
         renderRows(item, titleRows(element), true);
         fetchByHash(hash, idx, function (streams) {
-            if (streams && streams.length) {
-                var rows = mergeRows(streams, pt);
-                cache[ckey] = { state: 'done', rows: rows }; saveCache();
-                renderRows(item, rows, false);
-            } else { renderRows(item, titleRows(element), false); }
+            var rows = safeRows(streams, pt);
+            if (rows) { cache[ckey] = { state: 'done', rows: rows }; saveCache(); renderRows(item, rows, false); }
+            else renderRows(item, titleRows(element), false);
         });
     }
 
