@@ -2,19 +2,18 @@
     'use strict';
 
     /* ───────────────────────────────────────────────────────────
-       MEDIAINFO DEBUG v0.15 — двухслойные бейджи (TV)
-       Слой 1 (мгновенно, как фильтр Lampa): парсим НАЗВАНИЕ →
-         4K/1080p/720p, HDR10/HDR10+/Dolby Vision, кодек. Без сети.
-       Слой 2 (ffprobe, в очереди): точные аудио/субтитры/битрейты,
-         дорисовываем поверх. HDR/DV из названия подставляется, если
-         ffprobe (185) не отдал цветовые поля.
-       Источник ffprobe: 127.0.0.1:8090 /ffp → резерв 185.204.0.61.
-       Постоянный кэш в Lampa.Storage. Без патчей глобальных объектов.
+       MEDIAINFO DEBUG v0.16 — двухслойные бейджи + оба события
+       Событие torrent_file (браузер/внутр. плеер): мгновенно полные
+         дорожки из el.ffprobe или по реальному el.torrent_hash.
+       Событие torrent (Android TV, внешний плеер): слой из названия +
+         ffprobe через add→btih→/ffp(или 185).
+       TorrServer: Lampa.Torserver.url() (браузер/удалённый) + локальный
+         127.0.0.1:8090. Кэш в Lampa.Storage. Без патчей globals.
        ─────────────────────────────────────────────────────────── */
 
-    var VERSION    = 'v0.15';
+    var VERSION    = 'v0.16';
     var HOST185    = '185.204.0.61:8080';
-    var TS_BASES   = ['http://127.0.0.1:8090', 'http://localhost:8090', 'http://127.0.0.1:8080'];
+    var TS_BASES   = [];
     var TS_BASE    = null;
     var AUTO_LIMIT = 8;
     var CONCURRENCY = 3;
@@ -158,13 +157,11 @@
         return out;
     }
 
-    /* слияние: ffprobe + флаги из названия */
     function mergeRows(streams, pt) {
         var rows = build(streams);
         var v = rows.filter(function (r) { return r.c === 'v'; })[0];
-        if (!v) {
-            var c = titleVideoChip(pt); if (c) rows.unshift(c);
-        } else {
+        if (!v) { var c = titleVideoChip(pt); if (c) rows.unshift(c); }
+        else {
             if (pt.res && !/4K|1080p|720p|480p|\d{3,4}x\d{3,4}/.test(v.t)) v.t = pt.res + ' · ' + v.t;
             if (pt.hdr && !/HDR|Dolby|HLG/i.test(v.t)) v.t += ' · ' + pt.hdr;
         }
@@ -204,6 +201,7 @@
             function () { if (attempt < 4) setTimeout(function () { getIndex(hash, attempt + 1, cb); }, 1500); else cb(0); });
     }
     function ffp(hash, idx, attempt, cb) {
+        if (!TS_BASE) return cb(null);
         nativeReq(TS_BASE + '/ffp/' + hash + '/' + idx, 'json', false,
             guard('ffp', function (j) { var s = j && j.streams; if (s && s.length) { log('ffp ok idx=' + idx); cb(s); } else cb(null); }),
             function (jq, ex) {
@@ -227,7 +225,14 @@
         } catch (e) {}
     }
 
-    /* ── очередь ─────────────────────────────────────────────── */
+    /* По известному hash: ffp (если есть) → 185 */
+    function fetchByHash(hash, idx, cb) {
+        function fb() { probe185(hash, idx, cb); }
+        if (!ffpAvailable || !TS_BASE) return fb();
+        ffp(hash, idx, 0, function (s) { if (s && s.length) cb(s); else fb(); });
+    }
+
+    /* ── очередь (путь torrent/render, без готового hash) ────── */
     function enqueue(element, item, priority) {
         var link = element.Link || element.link || element.MagnetUri || element.url;
         if (!link || !TS_BASE) return;
@@ -258,11 +263,7 @@
                 rows = mergeRows(streams, pt);
                 cache[job.link] = { state: 'done', rows: rows }; saveCache();
                 log('✓[' + src + '] ' + (rows[0] || {}).t);
-            } else {
-                rows = trows;                 // остаётся слой из названия
-                cache[job.link] = null;
-                log('ffprobe пусто, заголовок: ' + ((rows[0] || {}).t || '—'));
-            }
+            } else { rows = trows; cache[job.link] = null; log('ffprobe пусто, заголовок: ' + ((rows[0] || {}).t || '—')); }
             renderRows(job.item, rows, false);
             onDone();
         }
@@ -278,14 +279,14 @@
         if (direct) go(direct); else tsAdd(job.link, go);
     }
 
-    /* ── render hook ─────────────────────────────────────────── */
-    function onRender(element, item) {
+    /* ── событие torrent (Android TV: список раздач) ─────────── */
+    function onTorrentRender(element, item) {
         if (element.ffprobe && element.ffprobe.length) { renderRows(item, mergeRows(element.ffprobe, parseTitle(element.Title || element.title))); return; }
         var link = element.Link || element.link || element.MagnetUri || element.url;
         if (link && cache[link] && cache[link].state === 'done') { renderRows(item, cache[link].rows); return; }
 
         var willEnrich = autoCount < AUTO_LIMIT;
-        renderRows(item, titleRows(element), willEnrich);   // СЛОЙ 1 — мгновенно
+        renderRows(item, titleRows(element), willEnrich);
         if (willEnrich) { autoCount++; enqueue(element, item, false); }
 
         try {
@@ -297,7 +298,36 @@
         } catch (e) {}
     }
 
+    /* ── событие torrent_file (браузер/внутр.плеер: список файлов) ── */
+    function onFileRender(element, item) {
+        var pt = parseTitle(element.title || element.Title || '');
+        if (element.ffprobe && Array.isArray(element.ffprobe) && element.ffprobe.length) {
+            renderRows(item, mergeRows(element.ffprobe, pt));
+            return;
+        }
+        var hash = element.torrent_hash || element.info_hash || extractHash(element.hash);
+        if (!hash) return;
+        var idx = element.id !== undefined ? element.id : (element.file_index !== undefined ? element.file_index : 0);
+        var ckey = 'h_' + hash + '_' + idx;
+        if (cache[ckey] && cache[ckey].state === 'done') { renderRows(item, cache[ckey].rows); return; }
+
+        renderRows(item, titleRows(element), true);
+        fetchByHash(hash, idx, function (streams) {
+            if (streams && streams.length) {
+                var rows = mergeRows(streams, pt);
+                cache[ckey] = { state: 'done', rows: rows }; saveCache();
+                renderRows(item, rows, false);
+                log('✓[file] ' + (rows[0] || {}).t);
+            } else { renderRows(item, titleRows(element), false); }
+        });
+    }
+
     /* ── init ────────────────────────────────────────────────── */
+    function buildBases() {
+        TS_BASES = [];
+        try { var u = Lampa.Torserver.url(); if (u) TS_BASES.push(String(u).replace(/\/+$/, '')); } catch (e) {}
+        ['http://127.0.0.1:8090', 'http://localhost:8090', 'http://127.0.0.1:8080'].forEach(function (b) { if (TS_BASES.indexOf(b) < 0) TS_BASES.push(b); });
+    }
     function detectTS() {
         TS_BASES.forEach(function (base) {
             nativeReq(base + '/echo', 'text', false,
@@ -318,13 +348,17 @@
         document.head.appendChild(st);
         loadCache();
         log('кэш: ' + Object.keys(cache).length + ' записей');
+        buildBases();
         detectTS();
         if (!(window.Lampa && Lampa.Listener)) { log('Lampa.Listener нет'); return; }
         Lampa.Listener.follow('torrent', guard('ev', function (data) {
-            if (data.type === 'render' && data.element && data.item) onRender(data.element, data.item);
+            if (data.type === 'render' && data.element && data.item) onTorrentRender(data.element, data.item);
             if (data.type === 'list_open' || data.type === 'open') autoCount = 0;
         }));
-        log('готов; auto=' + AUTO_LIMIT + ' conc=' + CONCURRENCY);
+        Lampa.Listener.follow('torrent_file', guard('evf', function (data) {
+            if (data.type === 'render' && data.element && data.item) onFileRender(data.element, data.item);
+        }));
+        log('готов; auto=' + AUTO_LIMIT + ' conc=' + CONCURRENCY + ' (torrent + torrent_file)');
     })();
 
     window.MIDBG = { log: log, clearCache: function () { cache = {}; queue = []; try { Lampa.Storage.set(CACHE_KEY, {}); } catch (e) {} log('кэш очищен'); } };
