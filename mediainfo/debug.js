@@ -2,16 +2,17 @@
     'use strict';
 
     /* ───────────────────────────────────────────────────────────
-       MEDIAINFO DEBUG v0.14 — бейджи дорожек (TV), ускорение + кэш
-       - /ffp 400 → ffprobe в сборке нет: глобально отключаем,
-         дальше сразу 185 (без 7.5с ретраев на строку);
-       - постоянный кэш в Lampa.Storage (переживает перезапуск);
-       - лог WxH + color_transfer/side_data для диагностики 720p/HDR.
-       Источник: 127.0.0.1:8090 /ffp → резерв 185.204.0.61.
-       Очередь: авто верхние 8 + lazy по фокусу. Без патчей globals.
+       MEDIAINFO DEBUG v0.15 — двухслойные бейджи (TV)
+       Слой 1 (мгновенно, как фильтр Lampa): парсим НАЗВАНИЕ →
+         4K/1080p/720p, HDR10/HDR10+/Dolby Vision, кодек. Без сети.
+       Слой 2 (ffprobe, в очереди): точные аудио/субтитры/битрейты,
+         дорисовываем поверх. HDR/DV из названия подставляется, если
+         ffprobe (185) не отдал цветовые поля.
+       Источник ffprobe: 127.0.0.1:8090 /ffp → резерв 185.204.0.61.
+       Постоянный кэш в Lampa.Storage. Без патчей глобальных объектов.
        ─────────────────────────────────────────────────────────── */
 
-    var VERSION    = 'v0.14';
+    var VERSION    = 'v0.15';
     var HOST185    = '185.204.0.61:8080';
     var TS_BASES   = ['http://127.0.0.1:8090', 'http://localhost:8090', 'http://127.0.0.1:8080'];
     var TS_BASE    = null;
@@ -26,7 +27,7 @@
     /* ── мини-лог ────────────────────────────────────────────── */
     var bot = document.createElement('div');
     bot.id = 'mi-log';
-    bot.style.cssText = 'position:fixed;left:0;right:0;bottom:0;max-height:28%;z-index:2147483647;' +
+    bot.style.cssText = 'position:fixed;left:0;right:0;bottom:0;max-height:26%;z-index:2147483647;' +
         'background:rgba(0,0,0,.78);color:#7CFC00;font-family:monospace;font-size:11px;line-height:1.3;' +
         'padding:.3em .6em;overflow:hidden;white-space:pre-wrap;word-break:break-all;pointer-events:none';
     var blines = [];
@@ -42,20 +43,13 @@
 
     /* ── постоянный кэш ──────────────────────────────────────── */
     function loadCache() {
-        try {
-            var o = Lampa.Storage.get(CACHE_KEY, {});
-            if (o && typeof o === 'object') for (var k in o) cache[k] = { state: 'done', rows: o[k] };
-        } catch (e) {}
+        try { var o = Lampa.Storage.get(CACHE_KEY, {}); if (o && typeof o === 'object') for (var k in o) cache[k] = { state: 'done', rows: o[k] }; } catch (e) {}
     }
     var saveTimer = null;
     function saveCache() {
         clearTimeout(saveTimer);
         saveTimer = setTimeout(function () {
-            try {
-                var o = {}, n = 0;
-                for (var k in cache) if (cache[k] && cache[k].state === 'done') { o[k] = cache[k].rows; if (++n > 800) break; }
-                Lampa.Storage.set(CACHE_KEY, o);
-            } catch (e) {}
+            try { var o = {}, n = 0; for (var k in cache) if (cache[k] && cache[k].state === 'done') { o[k] = cache[k].rows; if (++n > 800) break; } Lampa.Storage.set(CACHE_KEY, o); } catch (e) {}
         }, 1000);
     }
 
@@ -74,11 +68,37 @@
         return null;
     }
 
-    /* ── разбор ffprobe ──────────────────────────────────────── */
-    function bps(s) {
-        var v = s.bit_rate || (s.tags && (s.tags.BPS || s.tags['BPS-eng'] || s.tags['BPS-en']));
-        v = parseInt(v, 10); return isNaN(v) ? 0 : v;
+    /* ── СЛОЙ 1: разбор названия ──────────────────────────────── */
+    function parseTitle(title) {
+        var s = ' ' + (title || '').toLowerCase() + ' ';
+        var res = /2160|\buhd\b|\b4k\b/.test(s) ? '4K'
+                : /1080|fullhd/.test(s) ? '1080p'
+                : /720/.test(s) ? '720p'
+                : /480/.test(s) ? '480p' : '';
+        var codec = /hevc|h\.?265|x265/.test(s) ? 'HEVC'
+                  : /av1/.test(s) ? 'AV1'
+                  : /h\.?264|x264|\bavc\b/.test(s) ? 'H.264' : '';
+        var hdr = /dolby\s*vision|dovi|dvhe|dv\s*p[78]/.test(s) ? 'Dolby Vision'
+                : /hdr10\+|hdr10plus|hdr\+/.test(s) ? 'HDR10+'
+                : /hdr10/.test(s) ? 'HDR10'
+                : /\bhdr\b/.test(s) ? 'HDR'
+                : /\bhlg\b/.test(s) ? 'HLG' : '';
+        return { res: res, codec: codec, hdr: hdr };
     }
+    function titleVideoChip(pt) {
+        var vp = [];
+        if (pt.res) vp.push(pt.res);
+        if (pt.codec) vp.push(pt.codec);
+        if (pt.hdr) vp.push(pt.hdr);
+        return vp.length ? { c: 'v', t: vp.join(' · ') } : null;
+    }
+    function titleRows(element) {
+        var c = titleVideoChip(parseTitle(element.Title || element.title));
+        return c ? [c] : [];
+    }
+
+    /* ── СЛОЙ 2: разбор ffprobe ──────────────────────────────── */
+    function bps(s) { var v = s.bit_rate || (s.tags && (s.tags.BPS || s.tags['BPS-eng'] || s.tags['BPS-en'])); v = parseInt(v, 10); return isNaN(v) ? 0 : v; }
     function resLabel(v) {
         var w = v.width || v.coded_width || 0, h = v.height || v.coded_height || 0;
         if (w >= 3000 || h >= 1900) return '4K';
@@ -88,9 +108,7 @@
         return w && h ? w + 'x' + h : '';
     }
     function hdrLabel(v) {
-        var ct = (v.color_transfer || '').toLowerCase();
-        var cp = (v.color_primaries || '').toLowerCase();
-        var dv = false;
+        var ct = (v.color_transfer || '').toLowerCase(), cp = (v.color_primaries || '').toLowerCase(), dv = false;
         try { dv = (v.side_data_list || []).some(function (sd) { return /dovi|dolby vision/i.test(JSON.stringify(sd)); }); } catch (e) {}
         if (!dv && /dvhe|dvh1|dav1|dvav/i.test(v.codec_tag_string || '')) dv = true;
         if (dv) return 'Dolby Vision';
@@ -106,9 +124,7 @@
         if (a.channels === 2) return '2.0'; if (a.channels === 1) return '1.0';
         return a.channels ? a.channels + 'ch' : '';
     }
-    function videoOf(streams) {
-        return streams.filter(function (s) { return s.codec_type === 'video' && s.codec_name !== 'mjpeg' && s.codec_name !== 'png'; })[0];
-    }
+    function videoOf(streams) { return streams.filter(function (s) { return s.codec_type === 'video' && s.codec_name !== 'mjpeg' && s.codec_name !== 'png'; })[0]; }
 
     function build(streams) {
         var out = [];
@@ -142,28 +158,35 @@
         return out;
     }
 
-    function renderRows(item, rows) {
+    /* слияние: ffprobe + флаги из названия */
+    function mergeRows(streams, pt) {
+        var rows = build(streams);
+        var v = rows.filter(function (r) { return r.c === 'v'; })[0];
+        if (!v) {
+            var c = titleVideoChip(pt); if (c) rows.unshift(c);
+        } else {
+            if (pt.res && !/4K|1080p|720p|480p|\d{3,4}x\d{3,4}/.test(v.t)) v.t = pt.res + ' · ' + v.t;
+            if (pt.hdr && !/HDR|Dolby|HLG/i.test(v.t)) v.t += ' · ' + pt.hdr;
+        }
+        return rows;
+    }
+
+    function renderRows(item, rows, pending) {
         try {
             item.find('.mi-badge').remove();
-            if (!rows || !rows.length) return;
-            item.append('<div class="mi-badge">' + rows.map(function (r) {
-                return '<span class="mi-' + r.c + '">' + r.t.replace(/</g, '&lt;') + '</span>';
-            }).join('') + '</div>');
+            if ((!rows || !rows.length) && !pending) return;
+            var html = (rows || []).map(function (r) { return '<span class="mi-' + r.c + '">' + r.t.replace(/</g, '&lt;') + '</span>'; }).join('');
+            if (pending) html += '<span class="mi-load">···</span>';
+            item.append('<div class="mi-badge">' + html + '</div>');
         } catch (e) {}
     }
-    function loading(item, on) { try { item.find('.mi-badge').remove(); if (on) item.append('<div class="mi-badge mi-load">···</div>'); } catch (e) {} }
 
     /* ── TorrServer ──────────────────────────────────────────── */
     function tsAdd(link, cb) {
-        nativeReq(TS_BASE + '/torrents', 'json',
-            JSON.stringify({ action: 'add', link: link, title: '[mi-probe]', save_to_db: false }),
-            guard('add', function (j) { cb((j && (j.hash || (j.torrent && j.torrent.hash))) || null); }),
-            function () { cb(null); });
+        nativeReq(TS_BASE + '/torrents', 'json', JSON.stringify({ action: 'add', link: link, title: '[mi-probe]', save_to_db: false }),
+            guard('add', function (j) { cb((j && (j.hash || (j.torrent && j.torrent.hash))) || null); }), function () { cb(null); });
     }
-    function tsDrop(hash) {
-        if (!hash) return;
-        nativeReq(TS_BASE + '/torrents', 'text', JSON.stringify({ action: 'drop', hash: hash }), function () {}, function () {});
-    }
+    function tsDrop(hash) { if (!hash) return; nativeReq(TS_BASE + '/torrents', 'text', JSON.stringify({ action: 'drop', hash: hash }), function () {}, function () {}); }
     function pickIndex(fs) {
         if (!fs || !fs.length) return 0;
         var arr = fs.slice().sort(function (a, b) { return (b.length || 0) - (a.length || 0); });
@@ -182,10 +205,7 @@
     }
     function ffp(hash, idx, attempt, cb) {
         nativeReq(TS_BASE + '/ffp/' + hash + '/' + idx, 'json', false,
-            guard('ffp', function (j) {
-                var s = j && j.streams;
-                if (s && s.length) { log('ffp ok idx=' + idx); cb(s); } else cb(null);
-            }),
+            guard('ffp', function (j) { var s = j && j.streams; if (s && s.length) { log('ffp ok idx=' + idx); cb(s); } else cb(null); }),
             function (jq, ex) {
                 var st = jq && jq.status;
                 if (st === 400) { ffpAvailable = false; log('ffp 400 → нет ffprobe, далее только 185'); return cb(null); }
@@ -196,17 +216,13 @@
 
     /* ── резерв 185 ──────────────────────────────────────────── */
     function probe185(hash, idx, cb) {
-        var got = false;
-        function done(s) { if (got) return; got = true; cb(s); }
+        var got = false; function done(s) { if (got) return; got = true; cb(s); }
         nativeReq('http://' + HOST185 + '/api?hash=' + hash + '&index=' + idx, 'json', false,
             guard('185http', function (j) { if (j && j.streams && j.streams.length) done(j.streams); }), function () {});
         try {
             var ws = new WebSocket('ws://' + HOST185 + '/?' + hash + '&index=' + idx);
             var t = setTimeout(function () { try { ws.close(); } catch (e) {} done(null); }, 22000);
-            ws.onmessage = guard('185ws', function (e) {
-                var j; try { j = JSON.parse(String(e.data || '')); } catch (x) { return; }
-                if (j && j.streams && j.streams.length) { clearTimeout(t); try { ws.close(); } catch (e) {} done(j.streams); }
-            });
+            ws.onmessage = guard('185ws', function (e) { var j; try { j = JSON.parse(String(e.data || '')); } catch (x) { return; } if (j && j.streams && j.streams.length) { clearTimeout(t); try { ws.close(); } catch (e) {} done(j.streams); } });
             ws.onerror = function () {};
         } catch (e) {}
     }
@@ -216,9 +232,7 @@
         var link = element.Link || element.link || element.MagnetUri || element.url;
         if (!link || !TS_BASE) return;
         if (cache[link]) { if (cache[link].state === 'done') renderRows(item, cache[link].rows); return; }
-        for (var i = 0; i < queue.length; i++) {
-            if (queue[i].link === link) { if (priority) queue.unshift(queue.splice(i, 1)[0]); return; }
-        }
+        for (var i = 0; i < queue.length; i++) { if (queue[i].link === link) { if (priority) queue.unshift(queue.splice(i, 1)[0]); return; } }
         var job = { element: element, item: item, link: link };
         if (priority) queue.unshift(job); else queue.push(job);
         pump();
@@ -232,32 +246,33 @@
     }
     function resolveJob(job, onDone) {
         cache[job.link] = { state: 'pending' };
-        loading(job.item, true);
+        var pt = parseTitle(job.element.Title || job.element.title);
+        var trows = titleRows(job.element);
         var direct = extractHash(job.element.MagnetUri) || extractHash(job.element.Link);
 
         function finish(streams, src) {
-            loading(job.item, false);
+            var rows;
             if (streams && streams.length) {
                 var vv = videoOf(streams);
                 if (vv) log('dims ' + (vv.width || '?') + 'x' + (vv.height || '?') + ' ct=' + (vv.color_transfer || '-') + ' sd=' + ((vv.side_data_list || []).length));
-                var rows = build(streams);
-                cache[job.link] = { state: 'done', rows: rows };
-                saveCache();
-                renderRows(job.item, rows);
+                rows = mergeRows(streams, pt);
+                cache[job.link] = { state: 'done', rows: rows }; saveCache();
                 log('✓[' + src + '] ' + (rows[0] || {}).t);
-            } else { cache[job.link] = null; log('пусто: ' + (job.element.Title || '').slice(0, 22)); }
+            } else {
+                rows = trows;                 // остаётся слой из названия
+                cache[job.link] = null;
+                log('ffprobe пусто, заголовок: ' + ((rows[0] || {}).t || '—'));
+            }
+            renderRows(job.item, rows, false);
             onDone();
         }
 
         function go(hash) {
             if (!hash) { finish(null); return; }
             getIndex(hash, 0, function (idx) {
-                function fallback() { probe185(hash, idx, function (s2) { tsDrop(hash); finish(s2, '185'); }); }
-                if (!ffpAvailable) { fallback(); return; }
-                ffp(hash, idx, 0, function (streams) {
-                    if (streams && streams.length) { tsDrop(hash); finish(streams, 'ffp'); }
-                    else fallback();
-                });
+                function fb() { probe185(hash, idx, function (s2) { tsDrop(hash); finish(s2, '185'); }); }
+                if (!ffpAvailable) return fb();
+                ffp(hash, idx, 0, function (streams) { if (streams && streams.length) { tsDrop(hash); finish(streams, 'ffp'); } else fb(); });
             });
         }
         if (direct) go(direct); else tsAdd(job.link, go);
@@ -265,17 +280,28 @@
 
     /* ── render hook ─────────────────────────────────────────── */
     function onRender(element, item) {
-        if (element.ffprobe && element.ffprobe.length) { renderRows(item, build(element.ffprobe)); return; }
-        if (autoCount < AUTO_LIMIT) { autoCount++; enqueue(element, item, false); }
-        try { item.on('hover:focus', guard('focus', function () { enqueue(element, item, true); })); } catch (e) {}
+        if (element.ffprobe && element.ffprobe.length) { renderRows(item, mergeRows(element.ffprobe, parseTitle(element.Title || element.title))); return; }
+        var link = element.Link || element.link || element.MagnetUri || element.url;
+        if (link && cache[link] && cache[link].state === 'done') { renderRows(item, cache[link].rows); return; }
+
+        var willEnrich = autoCount < AUTO_LIMIT;
+        renderRows(item, titleRows(element), willEnrich);   // СЛОЙ 1 — мгновенно
+        if (willEnrich) { autoCount++; enqueue(element, item, false); }
+
+        try {
+            item.on('hover:focus', guard('focus', function () {
+                if (link && cache[link] && cache[link].state === 'done') return;
+                renderRows(item, titleRows(element), true);
+                enqueue(element, item, true);
+            }));
+        } catch (e) {}
     }
 
     /* ── init ────────────────────────────────────────────────── */
     function detectTS() {
         TS_BASES.forEach(function (base) {
             nativeReq(base + '/echo', 'text', false,
-                guard('echo', function (resp) { if (!TS_BASE) { TS_BASE = base; log('TorrServer: ' + base + ' (' + String(resp).slice(0, 12) + ')'); pump(); } }),
-                function () {});
+                guard('echo', function (resp) { if (!TS_BASE) { TS_BASE = base; log('TorrServer: ' + base + ' (' + String(resp).slice(0, 12) + ')'); pump(); } }), function () {});
         });
     }
     guard('init', function () {
@@ -288,10 +314,10 @@
             '.mi-v{background:rgba(80,160,255,.15);border-color:rgba(80,160,255,.55)}' +
             '.mi-a{background:rgba(124,252,0,.13);border-color:rgba(124,252,0,.5)}' +
             '.mi-s{background:rgba(255,200,0,.13);border-color:rgba(255,200,0,.5)}' +
-            '.mi-load{opacity:.4;letter-spacing:.3em;border:0!important;background:none!important}';
+            '.mi-load{opacity:.4;letter-spacing:.25em;border:0!important;background:none!important}';
         document.head.appendChild(st);
         loadCache();
-        log('кэш загружен: ' + Object.keys(cache).length + ' записей');
+        log('кэш: ' + Object.keys(cache).length + ' записей');
         detectTS();
         if (!(window.Lampa && Lampa.Listener)) { log('Lampa.Listener нет'); return; }
         Lampa.Listener.follow('torrent', guard('ev', function (data) {
@@ -301,9 +327,6 @@
         log('готов; auto=' + AUTO_LIMIT + ' conc=' + CONCURRENCY);
     })();
 
-    window.MIDBG = {
-        log: log,
-        clearCache: function () { cache = {}; queue = []; try { Lampa.Storage.set(CACHE_KEY, {}); } catch (e) {} log('кэш очищен'); }
-    };
+    window.MIDBG = { log: log, clearCache: function () { cache = {}; queue = []; try { Lampa.Storage.set(CACHE_KEY, {}); } catch (e) {} log('кэш очищен'); } };
 
 })();
