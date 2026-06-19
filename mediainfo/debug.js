@@ -2,23 +2,25 @@
     'use strict';
 
     /* ───────────────────────────────────────────────────────────
-       MEDIAINFO DEBUG v0.13 — богатые бейджи дорожек (TV)
-       Разрешение классифицируем по ШИРИНЕ (широкоформат 3840x1606
-       это 4K, а не 1080p). Индекс видеофайла берём из /torrents get
-       (с ретраями, пока готов file_stats) и шлём в /ffp и 185.
+       MEDIAINFO DEBUG v0.14 — бейджи дорожек (TV), ускорение + кэш
+       - /ffp 400 → ffprobe в сборке нет: глобально отключаем,
+         дальше сразу 185 (без 7.5с ретраев на строку);
+       - постоянный кэш в Lampa.Storage (переживает перезапуск);
+       - лог WxH + color_transfer/side_data для диагностики 720p/HDR.
        Источник: 127.0.0.1:8090 /ffp → резерв 185.204.0.61.
-       Больше UNCENSORED: HDR10/DV/HLG, Atmos, кодеки и битрейты,
-       формат субтитров. Очередь: авто верхние 8 + lazy по фокусу.
+       Очередь: авто верхние 8 + lazy по фокусу. Без патчей globals.
        ─────────────────────────────────────────────────────────── */
 
-    var VERSION    = 'v0.13';
+    var VERSION    = 'v0.14';
     var HOST185    = '185.204.0.61:8080';
     var TS_BASES   = ['http://127.0.0.1:8090', 'http://localhost:8090', 'http://127.0.0.1:8080'];
     var TS_BASE    = null;
     var AUTO_LIMIT = 8;
-    var CONCURRENCY = 2;
+    var CONCURRENCY = 3;
     var VIDEO_EXT  = /\.(mkv|mp4|avi|m4v|mov|ts|m2ts|mpg|mpeg|webm|wmv)$/i;
+    var CACHE_KEY  = 'mediainfo_cache_v1';
 
+    var ffpAvailable = true;
     var cache = {}, queue = [], running = 0, autoCount = 0;
 
     /* ── мини-лог ────────────────────────────────────────────── */
@@ -36,6 +38,25 @@
     }
     function guard(label, fn) {
         return function () { try { return fn.apply(this, arguments); } catch (e) { log('✗ ' + label + ': ' + (e && e.message ? e.message : e)); } };
+    }
+
+    /* ── постоянный кэш ──────────────────────────────────────── */
+    function loadCache() {
+        try {
+            var o = Lampa.Storage.get(CACHE_KEY, {});
+            if (o && typeof o === 'object') for (var k in o) cache[k] = { state: 'done', rows: o[k] };
+        } catch (e) {}
+    }
+    var saveTimer = null;
+    function saveCache() {
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(function () {
+            try {
+                var o = {}, n = 0;
+                for (var k in cache) if (cache[k] && cache[k].state === 'done') { o[k] = cache[k].rows; if (++n > 800) break; }
+                Lampa.Storage.set(CACHE_KEY, o);
+            } catch (e) {}
+        }, 1000);
     }
 
     /* ── сеть ────────────────────────────────────────────────── */
@@ -56,12 +77,10 @@
     /* ── разбор ffprobe ──────────────────────────────────────── */
     function bps(s) {
         var v = s.bit_rate || (s.tags && (s.tags.BPS || s.tags['BPS-eng'] || s.tags['BPS-en']));
-        v = parseInt(v, 10);
-        return isNaN(v) ? 0 : v;
+        v = parseInt(v, 10); return isNaN(v) ? 0 : v;
     }
     function resLabel(v) {
-        var w = v.width || 0, h = v.height || 0;
-        // классифицируем по ширине (фильмы бывают широкоформатные, напр. 3840x1606)
+        var w = v.width || v.coded_width || 0, h = v.height || v.coded_height || 0;
         if (w >= 3000 || h >= 1900) return '4K';
         if (w >= 1800 || h >= 1000) return '1080p';
         if (w >= 1200 || h >= 700)  return '720p';
@@ -87,10 +106,13 @@
         if (a.channels === 2) return '2.0'; if (a.channels === 1) return '1.0';
         return a.channels ? a.channels + 'ch' : '';
     }
+    function videoOf(streams) {
+        return streams.filter(function (s) { return s.codec_type === 'video' && s.codec_name !== 'mjpeg' && s.codec_name !== 'png'; })[0];
+    }
 
     function build(streams) {
         var out = [];
-        var v = streams.filter(function (s) { return s.codec_type === 'video' && s.codec_name !== 'mjpeg' && s.codec_name !== 'png'; })[0];
+        var v = videoOf(streams);
         if (v) {
             var p = [];
             var r = resLabel(v); if (r) p.push(r);
@@ -120,19 +142,18 @@
         return out;
     }
 
-    function renderBadge(item, streams) {
+    function renderRows(item, rows) {
         try {
             item.find('.mi-badge').remove();
-            var rows = build(streams);
-            if (!rows.length) return;
+            if (!rows || !rows.length) return;
             item.append('<div class="mi-badge">' + rows.map(function (r) {
                 return '<span class="mi-' + r.c + '">' + r.t.replace(/</g, '&lt;') + '</span>';
             }).join('') + '</div>');
-        } catch (e) { log('badge err ' + e.message); }
+        } catch (e) {}
     }
     function loading(item, on) { try { item.find('.mi-badge').remove(); if (on) item.append('<div class="mi-badge mi-load">···</div>'); } catch (e) {} }
 
-    /* ── локальный TorrServer: add → get index → ffp → drop ──── */
+    /* ── TorrServer ──────────────────────────────────────────── */
     function tsAdd(link, cb) {
         nativeReq(TS_BASE + '/torrents', 'json',
             JSON.stringify({ action: 'add', link: link, title: '[mi-probe]', save_to_db: false }),
@@ -163,17 +184,17 @@
         nativeReq(TS_BASE + '/ffp/' + hash + '/' + idx, 'json', false,
             guard('ffp', function (j) {
                 var s = j && j.streams;
-                if (s && s.length) { log('ffp ok idx=' + idx); cb(s); }
-                else cb(null);
+                if (s && s.length) { log('ffp ok idx=' + idx); cb(s); } else cb(null);
             }),
             function (jq, ex) {
-                if (attempt < 3) return setTimeout(function () { ffp(hash, idx, attempt + 1, cb); }, 2500);
-                log('ffp ERR ' + (ex || (jq && jq.status)));
-                cb(null, 'ffp-fail');
+                var st = jq && jq.status;
+                if (st === 400) { ffpAvailable = false; log('ffp 400 → нет ffprobe, далее только 185'); return cb(null); }
+                if (attempt < 2) return setTimeout(function () { ffp(hash, idx, attempt + 1, cb); }, 2000);
+                log('ffp ERR ' + (ex || st)); cb(null);
             });
     }
 
-    /* ── резерв: 185 ─────────────────────────────────────────── */
+    /* ── резерв 185 ──────────────────────────────────────────── */
     function probe185(hash, idx, cb) {
         var got = false;
         function done(s) { if (got) return; got = true; cb(s); }
@@ -194,7 +215,7 @@
     function enqueue(element, item, priority) {
         var link = element.Link || element.link || element.MagnetUri || element.url;
         if (!link || !TS_BASE) return;
-        if (cache[link]) { if (cache[link].state === 'done') renderBadge(item, cache[link].streams); return; }
+        if (cache[link]) { if (cache[link].state === 'done') renderRows(item, cache[link].rows); return; }
         for (var i = 0; i < queue.length; i++) {
             if (queue[i].link === link) { if (priority) queue.unshift(queue.splice(i, 1)[0]); return; }
         }
@@ -205,7 +226,7 @@
     function pump() {
         while (running < CONCURRENCY && queue.length) {
             var job = queue.shift();
-            if (cache[job.link] && cache[job.link].state === 'done') { renderBadge(job.item, cache[job.link].streams); continue; }
+            if (cache[job.link] && cache[job.link].state === 'done') { renderRows(job.item, cache[job.link].rows); continue; }
             running++; resolveJob(job, function () { running--; pump(); });
         }
     }
@@ -217,9 +238,13 @@
         function finish(streams, src) {
             loading(job.item, false);
             if (streams && streams.length) {
-                cache[job.link] = { state: 'done', streams: streams };
-                renderBadge(job.item, streams);
-                log('✓[' + src + '] ' + (build(streams)[0] || {}).t);
+                var vv = videoOf(streams);
+                if (vv) log('dims ' + (vv.width || '?') + 'x' + (vv.height || '?') + ' ct=' + (vv.color_transfer || '-') + ' sd=' + ((vv.side_data_list || []).length));
+                var rows = build(streams);
+                cache[job.link] = { state: 'done', rows: rows };
+                saveCache();
+                renderRows(job.item, rows);
+                log('✓[' + src + '] ' + (rows[0] || {}).t);
             } else { cache[job.link] = null; log('пусто: ' + (job.element.Title || '').slice(0, 22)); }
             onDone();
         }
@@ -227,9 +252,11 @@
         function go(hash) {
             if (!hash) { finish(null); return; }
             getIndex(hash, 0, function (idx) {
+                function fallback() { probe185(hash, idx, function (s2) { tsDrop(hash); finish(s2, '185'); }); }
+                if (!ffpAvailable) { fallback(); return; }
                 ffp(hash, idx, 0, function (streams) {
                     if (streams && streams.length) { tsDrop(hash); finish(streams, 'ffp'); }
-                    else { log('локальный ffp пуст → 185 idx=' + idx); probe185(hash, idx, function (s2) { tsDrop(hash); finish(s2, '185'); }); }
+                    else fallback();
                 });
             });
         }
@@ -238,7 +265,7 @@
 
     /* ── render hook ─────────────────────────────────────────── */
     function onRender(element, item) {
-        if (element.ffprobe && element.ffprobe.length) { renderBadge(item, element.ffprobe); return; }
+        if (element.ffprobe && element.ffprobe.length) { renderRows(item, build(element.ffprobe)); return; }
         if (autoCount < AUTO_LIMIT) { autoCount++; enqueue(element, item, false); }
         try { item.on('hover:focus', guard('focus', function () { enqueue(element, item, true); })); } catch (e) {}
     }
@@ -263,6 +290,8 @@
             '.mi-s{background:rgba(255,200,0,.13);border-color:rgba(255,200,0,.5)}' +
             '.mi-load{opacity:.4;letter-spacing:.3em;border:0!important;background:none!important}';
         document.head.appendChild(st);
+        loadCache();
+        log('кэш загружен: ' + Object.keys(cache).length + ' записей');
         detectTS();
         if (!(window.Lampa && Lampa.Listener)) { log('Lampa.Listener нет'); return; }
         Lampa.Listener.follow('torrent', guard('ev', function (data) {
@@ -272,6 +301,9 @@
         log('готов; auto=' + AUTO_LIMIT + ' conc=' + CONCURRENCY);
     })();
 
-    window.MIDBG = { log: log, clearCache: function () { cache = {}; queue = []; log('cleared'); } };
+    window.MIDBG = {
+        log: log,
+        clearCache: function () { cache = {}; queue = []; try { Lampa.Storage.set(CACHE_KEY, {}); } catch (e) {} log('кэш очищен'); }
+    };
 
 })();
